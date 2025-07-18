@@ -180,7 +180,7 @@ def bilinear_sampler(input, coords, align_corners=True, padding_mode="border"):
 
     coords -= 1
 
-    return F.grid_sample(input, coords, align_corners=align_corners, padding_mode=padding_mode)
+    return F.grid_sample(input, coords.to(input.dtype), align_corners=align_corners, padding_mode=padding_mode)
 
 
 def sample_features4d(input, coords):

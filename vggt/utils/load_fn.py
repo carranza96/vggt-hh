@@ -8,16 +8,18 @@ import torch
 from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
+import cv2
 
 
-def load_and_preprocess_images_square(image_path_list, target_size=1024):
+def load_and_preprocess_images_square(image_path_list, target_size=1024, undistort_images=False):
     """
     Load and preprocess images by center padding to square and resizing to target size.
     Also returns the position information of original pixels after transformation.
 
     Args:
         image_path_list (list): List of paths to image files
-        target_size (int, optional): Target size for both width and height. Defaults to 518.
+        target_size (int, optional): Target size for both width and height. Defaults to 1024.
+        undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
 
     Returns:
         tuple: (
@@ -32,23 +34,45 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
 
+    # Camera calibration constants (from handheldNerfs reference)
+    camera_matrix = np.array([
+        [1.54359610e+03, 0.00000000e+00, 5.43709494e+02],  # [fx,  0, cx]
+        [0.00000000e+00, 1.54981553e+03, 9.63609549e+02],  # [ 0, fy, cy]
+        [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]   # [ 0,  0,  1]
+    ])
+    
+    dist_coeffs = np.array([
+        8.79441447e-02,   # k1: radial distortion
+        1.63043039e-01,   # k2: radial distortion
+        9.67939127e-03,   # p1: tangential distortion
+        9.01387037e-04,   # p2: tangential distortion
+        -9.22214736e-01   # k3: radial distortion
+    ])
+
     images = []
     original_coords = []  # Renamed from position_info to be more descriptive
     to_tensor = TF.ToTensor()
 
     for image_path in image_path_list:
-        # Open image
+        # Open image with PIL for consistency with the rest of the pipeline
         img = Image.open(image_path)
 
-        # If there's an alpha channel, blend onto white background
         if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
+            r, g, b, a = img.split()
+            img = Image.merge("RGB", (r, g, b))
+        else:
+            img = img.convert("RGB")
 
-        # Convert to RGB
-        img = img.convert("RGB")
+        # Convert PIL image to numpy array for undistortion if needed
+        if undistort_images:
+            # Convert PIL to numpy array (OpenCV format: BGR)
+            img_array = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            # Apply undistortion
+            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs)
+            # Convert back to PIL (RGB format)
+            img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
 
-        # Get original dimensions
+        # Get original dimensions (after undistortion if applied)
         width, height = img.size
 
         # Make the image square by padding the shorter dimension
@@ -139,15 +163,11 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         # Open image
         img = Image.open(image_path)
 
-        # If there's an alpha channel, blend onto white background:
         if img.mode == "RGBA":
-            # Create white background
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            # Alpha composite onto the white background
-            img = Image.alpha_composite(background, img)
-
-        # Now convert to "RGB" (this step assigns white for transparent areas)
-        img = img.convert("RGB")
+            r, g, b, a = img.split()
+            img = Image.merge("RGB", (r, g, b))
+        else:
+            img = img.convert("RGB")
 
         width, height = img.size
 
@@ -228,3 +248,77 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
             images = images.unsqueeze(0)
 
     return images
+
+
+
+def load_and_preprocess_images_no_resize(image_path_list, undistort_images=False):
+    """
+    Load images at their original resolution without any resizing or preprocessing.
+    
+    Args:
+        image_path_list (list): List of paths to image files
+        undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
+        
+    Returns:
+        tuple: (
+            torch.Tensor: Batched tensor of images with shape (N, 3, H, W),
+            torch.Tensor: Array of shape (N, 6) containing [0, 0, W, H, W, H] for each image
+        )
+    """
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+    
+    # Camera calibration constants (from handheldNerfs reference)
+    camera_matrix = np.array([
+        [1.54359610e+03, 0.00000000e+00, 5.43709494e+02],  # [fx,  0, cx]
+        [0.00000000e+00, 1.54981553e+03, 9.63609549e+02],  # [ 0, fy, cy]
+        [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]   # [ 0,  0,  1]
+    ])
+    
+    dist_coeffs = np.array([
+        8.79441447e-02,   # k1: radial distortion
+        1.63043039e-01,   # k2: radial distortion
+        9.67939127e-03,   # p1: tangential distortion
+        9.01387037e-04,   # p2: tangential distortion
+        -9.22214736e-01   # k3: radial distortion
+    ])
+    
+    images = []
+    original_coords = []
+    to_tensor = TF.ToTensor()
+    
+    for image_path in image_path_list:
+        # Open image
+        img = Image.open(image_path)
+        
+        # Handle alpha channel
+        if img.mode == "RGBA":
+            r, g, b, a = img.split()
+            img = Image.merge("RGB", (r, g, b))
+        else:
+            img = img.convert("RGB")
+        
+        # Convert PIL image to numpy array for undistortion if needed
+        if undistort_images:
+            # Convert PIL to numpy array (OpenCV format: BGR)
+            img_array = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            # Apply undistortion
+            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs)
+            # Convert back to PIL (RGB format)
+            img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
+        
+        original_width, original_height = img.size
+        
+        # Convert to tensor without any resizing
+        img_tensor = to_tensor(img)
+        images.append(img_tensor)
+        
+        # Store coordinates: [x1, y1, x2, y2, original_width, original_height]
+        # Since no resizing, the image occupies the full tensor
+        original_coords.append(np.array([0, 0, original_width, original_height, original_width, original_height]))
+    
+    # Stack images (they should all have the same size)
+    images = torch.stack(images)
+    original_coords = torch.from_numpy(np.array(original_coords)).float()
+    
+    return images, original_coords

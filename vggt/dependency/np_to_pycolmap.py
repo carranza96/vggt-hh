@@ -8,7 +8,7 @@ import numpy as np
 import pycolmap
 from .projection import project_3D_points_np
 
-
+# TODO: Share camera support?
 def batch_np_matrix_to_pycolmap(
     points3d,
     extrinsics,
@@ -50,8 +50,6 @@ def batch_np_matrix_to_pycolmap(
     assert len(intrinsics) == N
     assert len(points3d) == P
     assert image_size.shape[0] == 2
-
-    reproj_mask = None
 
     if max_reproj_error is not None:
         projected_points_2d, projected_points_cam = project_3D_points_np(points3d, extrinsics, intrinsics)
@@ -239,10 +237,12 @@ def batch_np_matrix_to_pycolmap_wo_track(
     for fidx in range(N):
         # set camera
         if camera is None or (not shared_camera):
-            pycolmap_intri = _build_pycolmap_intri(fidx, intrinsics, camera_type)
+            intrinsic_idx = 0 if shared_camera else fidx
+            pycolmap_intri = _build_pycolmap_intri(intrinsic_idx, intrinsics, camera_type)
 
             camera = pycolmap.Camera(
-                model=camera_type, width=image_size[0], height=image_size[1], params=pycolmap_intri, camera_id=fidx + 1
+                model=camera_type, width=image_size[0], height=image_size[1], 
+                params=pycolmap_intri, camera_id=1 if shared_camera else fidx + 1
             )
 
             # add camera

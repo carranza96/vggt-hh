@@ -137,13 +137,13 @@ class ShallowEncoder(nn.Module):
         x = self.relu1(x)
 
         tmp = self.layer1(x)
-        x = x + F.interpolate(tmp, (x.shape[-2:]), mode="bilinear", align_corners=True)
+        x = x + F.interpolate(tmp, (x.shape[-2:]), mode="bilinear", align_corners=True).to(x.dtype)
         tmp = self.layer2(tmp)
-        x = x + F.interpolate(tmp, (x.shape[-2:]), mode="bilinear", align_corners=True)
+        x = x + F.interpolate(tmp, (x.shape[-2:]), mode="bilinear", align_corners=True).to(x.dtype)
         tmp = None
         x = self.conv2(x) + x
 
-        x = F.interpolate(x, (H // self.stride, W // self.stride), mode="bilinear", align_corners=True)
+        x = F.interpolate(x, (H // self.stride, W // self.stride), mode="bilinear", align_corners=True).to(x.dtype)
 
         return x
 

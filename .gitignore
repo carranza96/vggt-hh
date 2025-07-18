@@ -147,3 +147,11 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+*.png
+*.bin
+*.txt
+*.json
+*.yaml
+*.ply
+*.yml
+*.ini
