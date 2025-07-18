@@ -11,30 +11,13 @@ import numpy as np
 import cv2
 
 
-def load_and_preprocess_images_square(image_path_list, target_size=1024, undistort_images=False):
+def get_camera_intrinsics_for_undistortion():
     """
-    Load and preprocess images by center padding to square and resizing to target size.
-    Also returns the position information of original pixels after transformation.
-
-    Args:
-        image_path_list (list): List of paths to image files
-        target_size (int, optional): Target size for both width and height. Defaults to 1024.
-        undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
-
+    Get the original camera matrix and distortion coefficients for undistortion.
+    
     Returns:
-        tuple: (
-            torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, target_size, target_size),
-            torch.Tensor: Array of shape (N, 5) containing [x1, y1, x2, y2, width, height] for each image
-        )
-
-    Raises:
-        ValueError: If the input list is empty
+        tuple: (camera_matrix, dist_coeffs) as numpy arrays
     """
-    # Check for empty list
-    if len(image_path_list) == 0:
-        raise ValueError("At least 1 image is required")
-
-    # Camera calibration constants (from handheldNerfs reference)
     camera_matrix = np.array([
         [1.54359610e+03, 0.00000000e+00, 5.43709494e+02],  # [fx,  0, cx]
         [0.00000000e+00, 1.54981553e+03, 9.63609549e+02],  # [ 0, fy, cy]
@@ -48,6 +31,74 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
         9.01387037e-04,   # p2: tangential distortion
         -9.22214736e-01   # k3: radial distortion
     ])
+    
+    return camera_matrix, dist_coeffs
+
+
+def get_optimal_camera_matrix_for_image_size(image_width, image_height):
+    """
+    Get the optimal camera matrix and ROI for undistortion given image dimensions.
+    
+    Args:
+        image_width (int): Width of the image
+        image_height (int): Height of the image
+        
+    Returns:
+        tuple: (newK, roi) where newK is the optimal camera matrix and roi is (x, y, w, h)
+    """
+    camera_matrix, dist_coeffs = get_camera_intrinsics_for_undistortion()
+    
+    newK, roi = cv2.getOptimalNewCameraMatrix(
+        camera_matrix, dist_coeffs, 
+        (image_width, image_height), 0  # alpha=0 for maximum valid pixels
+    )
+    
+    return newK, roi
+
+
+def load_and_preprocess_images_square(image_path_list, target_size=1024, undistort_images=False):
+    """
+    Load and preprocess images by center padding to square and resizing to target size.
+    Also returns the position information of original pixels after transformation.
+
+    Args:
+        image_path_list (list): List of paths to image files
+        target_size (int, optional): Target size for both width and height. Defaults to 1024.
+        undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
+
+    Returns:
+        tuple: When undistort_images=False: (
+            torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, target_size, target_size),
+            torch.Tensor: Array of shape (N, 6) containing [x1, y1, x2, y2, width, height] for each image
+        )
+        tuple: When undistort_images=True: (
+            torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, target_size, target_size),
+            torch.Tensor: Array of shape (N, 6) containing [x1, y1, x2, y2, width, height] for each image,
+            numpy.ndarray: Updated camera matrix (3, 3) after optimal undistortion,
+            tuple: ROI coordinates (x, y, w, h) used for cropping
+        )
+
+    Raises:
+        ValueError: If the input list is empty
+    """
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+
+    # Get camera calibration constants
+    camera_matrix, dist_coeffs = get_camera_intrinsics_for_undistortion()
+    
+    # Pre-calculate optimal camera matrix and ROI (same for all images)
+    if undistort_images:
+        # Assuming all images have the same shape, use first image to get dimensions
+        sample_img = Image.open(image_path_list[0])
+        sample_width, sample_height = sample_img.size
+        
+        # Calculate optimal new camera matrix and ROI
+        newK, roi = get_optimal_camera_matrix_for_image_size(sample_width, sample_height)
+        x, y, w, h = roi
+        print(f"Optimal undistortion ROI: ({x}, {y}, {w}, {h})")
+        print(f"New camera matrix:\n{newK}")
 
     images = []
     original_coords = []  # Renamed from position_info to be more descriptive
@@ -67,8 +118,11 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
         if undistort_images:
             # Convert PIL to numpy array (OpenCV format: BGR)
             img_array = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            # Apply undistortion
-            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs)
+            # Apply undistortion with optimal camera matrix
+            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs, None, newK)
+            # Crop to ROI (consistent across all images)
+            img_array = img_array[y:y+h, x:x+w]
+            
             # Convert back to PIL (RGB format)
             img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
 
@@ -115,7 +169,11 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
             images = images.unsqueeze(0)
             original_coords = original_coords.unsqueeze(0)
 
-    return images, original_coords
+    # Return updated camera matrix if undistortion was applied
+    if undistort_images:
+        return images, original_coords, newK, roi
+    else:
+        return images, original_coords
 
 
 def load_and_preprocess_images(image_path_list, mode="crop"):
@@ -260,28 +318,36 @@ def load_and_preprocess_images_no_resize(image_path_list, undistort_images=False
         undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
         
     Returns:
-        tuple: (
+        tuple: When undistort_images=False: (
             torch.Tensor: Batched tensor of images with shape (N, 3, H, W),
             torch.Tensor: Array of shape (N, 6) containing [0, 0, W, H, W, H] for each image
+        )
+        tuple: When undistort_images=True: (
+            torch.Tensor: Batched tensor of images with shape (N, 3, H, W),
+            torch.Tensor: Array of shape (N, 6) containing [0, 0, W, H, W, H] for each image,
+            numpy.ndarray: Updated camera matrix (3, 3) after optimal undistortion,
+            tuple: ROI coordinates (x, y, w, h) used for cropping
         )
     """
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
     
-    # Camera calibration constants (from handheldNerfs reference)
-    camera_matrix = np.array([
-        [1.54359610e+03, 0.00000000e+00, 5.43709494e+02],  # [fx,  0, cx]
-        [0.00000000e+00, 1.54981553e+03, 9.63609549e+02],  # [ 0, fy, cy]
-        [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]   # [ 0,  0,  1]
-    ])
+    # Get camera calibration constants
+    camera_matrix, dist_coeffs = get_camera_intrinsics_for_undistortion()
     
-    dist_coeffs = np.array([
-        8.79441447e-02,   # k1: radial distortion
-        1.63043039e-01,   # k2: radial distortion
-        9.67939127e-03,   # p1: tangential distortion
-        9.01387037e-04,   # p2: tangential distortion
-        -9.22214736e-01   # k3: radial distortion
-    ])
+    # Pre-calculate optimal camera matrix and ROI if undistortion is enabled
+    newK = None
+    roi = None
+    if undistort_images:
+        # Use first image to get dimensions (assuming all images have same shape)
+        sample_img = Image.open(image_path_list[0])
+        sample_width, sample_height = sample_img.size
+        
+        # Calculate optimal new camera matrix and ROI
+        newK, roi = get_optimal_camera_matrix_for_image_size(sample_width, sample_height)
+        x, y, w, h = roi
+        print(f"Optimal undistortion ROI: ({x}, {y}, {w}, {h})")
+        print(f"New camera matrix:\n{newK}")
     
     images = []
     original_coords = []
@@ -302,8 +368,10 @@ def load_and_preprocess_images_no_resize(image_path_list, undistort_images=False
         if undistort_images:
             # Convert PIL to numpy array (OpenCV format: BGR)
             img_array = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            # Apply undistortion
-            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs)
+            # Apply undistortion with optimal camera matrix
+            img_array = cv2.undistort(img_array, camera_matrix, dist_coeffs, None, newK)
+            # Crop to ROI (consistent across all images)
+            img_array = img_array[y:y+h, x:x+w]
             # Convert back to PIL (RGB format)
             img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
         
@@ -321,4 +389,8 @@ def load_and_preprocess_images_no_resize(image_path_list, undistort_images=False
     images = torch.stack(images)
     original_coords = torch.from_numpy(np.array(original_coords)).float()
     
-    return images, original_coords
+    # Return updated camera matrix if undistortion was applied
+    if undistort_images:
+        return images, original_coords, newK, roi
+    else:
+        return images, original_coords

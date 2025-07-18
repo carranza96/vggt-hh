@@ -227,17 +227,27 @@ def demo_fn(args):
     # Load images and original coordinates
     vggt_fixed_resolution = args.vggt_resolution
     
+    # Initialize variables for undistortion
+    newK = None
+    roi = None
+    
     if args.load_imgs_squared:
         img_load_resolution = args.img_load_resolution
         print(f"Loading images with square padding and resize to {img_load_resolution}")
         if args.undistort_images:
             print("Applying camera undistortion before processing")
-        images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+            images, original_coords, newK, roi = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+            print(f"Using optimal camera matrix for undistortion")
+        else:
+            images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
     else:
         print(f"Loading images without resizing (original resolution)")
         if args.undistort_images:
             print("Applying camera undistortion to original resolution images")
-        images, original_coords = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
+            images, original_coords, newK, roi = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
+            print(f"Using optimal camera matrix for undistortion")
+        else:
+            images, original_coords = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
         img_load_resolution = None  # Variable resolution
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir} with shape {images.shape}")
@@ -253,12 +263,18 @@ def demo_fn(args):
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
-        # Define your known intrinsics for ORIGINAL 1920x1080 image
-        original_known_intrinsics = np.array([
-            [1543.5961, 0, 543.709494],
-            [0, 1549.81553, 963.609549],
-            [0, 0, 1]
-        ])
+        # Use optimal camera matrix if undistortion was applied, otherwise use original
+        if args.undistort_images and newK is not None:
+            print("Using optimal camera matrix from undistortion as base intrinsics")
+            original_known_intrinsics = newK
+        else:
+            print("Using hardcoded known intrinsics for original images")
+            # Define your known intrinsics for ORIGINAL 1920x1080 image
+            original_known_intrinsics = np.array([
+                [1543.5961, 0, 543.709494],
+                [0, 1549.81553, 963.609549],
+                [0, 0, 1]
+            ])
         
         # Get original and processed image dimensions
         original_width, original_height = original_coords[0, -2:].cpu().numpy()  # [1920, 1080]
@@ -269,14 +285,14 @@ def demo_fn(args):
         print(f"Original image size: {original_height}x{original_width}")
         print(f"Processed image size: {processed_height}x{processed_width}")
         
-        # Calculate padding transformation
+        # Calculate padding transformation (same logic regardless of undistortion)
         if processed_height == processed_width:  # Square padding
             if original_width < original_height:
-                # Width was padded (1080 -> 1920, then resized to 1024)
-                padding_x = (original_height - original_width) / 2  # (1920-1080)/2 = 420
+                # Width was padded to match height
+                padding_x = (original_height - original_width) / 2
                 padding_y = 0
             else:
-                # Height was padded
+                # Height was padded to match width
                 padding_x = 0
                 padding_y = (original_width - original_height) / 2
         else:
