@@ -236,10 +236,10 @@ def demo_fn(args):
         print(f"Loading images with square padding and resize to {img_load_resolution}")
         if args.undistort_images:
             print("Applying camera undistortion before processing")
-            images, original_coords, newK, roi = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+            images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
             print(f"Using optimal camera matrix for undistortion")
         else:
-            images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+            images, original_coords, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
     else:
         print(f"Loading images without resizing (original resolution)")
         if args.undistort_images:
@@ -256,6 +256,10 @@ def demo_fn(args):
     plt.figure()
     plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
     plt.savefig("sample_image.png")
+    
+    plt.figure()
+    plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
+    plt.savefig("sample_mask.png")
     
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
