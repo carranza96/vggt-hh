@@ -234,20 +234,16 @@ def demo_fn(args):
     if args.load_imgs_squared:
         img_load_resolution = args.img_load_resolution
         print(f"Loading images with square padding and resize to {img_load_resolution}")
+        print("Applying camera undistortion before processing" if args.undistort_images else "Loading without undistortion")
+        images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
         if args.undistort_images:
-            print("Applying camera undistortion before processing")
-            images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
             print(f"Using optimal camera matrix for undistortion")
-        else:
-            images, original_coords, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
     else:
         print(f"Loading images without resizing (original resolution)")
+        print("Applying camera undistortion to original resolution images" if args.undistort_images else "Loading without undistortion")
+        images, original_coords, newK, roi, masks = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
         if args.undistort_images:
-            print("Applying camera undistortion to original resolution images")
-            images, original_coords, newK, roi = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
             print(f"Using optimal camera matrix for undistortion")
-        else:
-            images, original_coords = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
         img_load_resolution = None  # Variable resolution
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir} with shape {images.shape}")
@@ -267,22 +263,14 @@ def demo_fn(args):
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
-        # Use optimal camera matrix if undistortion was applied, otherwise use original
-        if args.undistort_images and newK is not None:
-            print("Using optimal camera matrix from undistortion as base intrinsics")
-            original_known_intrinsics = newK
-        else:
-            print("Using hardcoded known intrinsics for original images")
-            # Define your known intrinsics for ORIGINAL 1920x1080 image
-            original_known_intrinsics = np.array([
-                [1543.5961, 0, 543.709494],
-                [0, 1549.81553, 963.609549],
-                [0, 0, 1]
-            ])
+        # Use the camera matrix returned from loading function
+        # This will be optimal matrix if undistortion was applied, otherwise original
+        print(f"Using {'optimal' if args.undistort_images else 'original'} camera matrix from loading function as base intrinsics")
+        original_known_intrinsics = newK
         
         # Get original and processed image dimensions
         original_width, original_height = original_coords[0, -2:].cpu().numpy()  # [1920, 1080]
-        # TODO: Revise if img loading resolution is not same as vggt_fixed_resolution(hence depth_map)
+        # TODO: Revise what happens if img loading resolution is not same as vggt_fixed_resolution(hence depth_map)
         processed_height, processed_width = images.shape[-2:]  # [1024, 1024] (padded square)
         # processed_height, processed_width = depth_map.shape[1], depth_map.shape[2] (952,952)
         
@@ -343,8 +331,8 @@ def demo_fn(args):
         
         intrinsic = intrinsic_for_unprojection
     else:
-            intrinsic_for_unprojection = intrinsic
-            print("Using VGGT-predicted intrinsics for 3D point unprojection")
+        print("Using VGGT-predicted intrinsics for 3D point unprojection")
+        intrinsic_for_unprojection = intrinsic
         
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic_for_unprojection)
     gpu_monitor.log_memory_stats("after VGGT inference")
