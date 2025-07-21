@@ -253,9 +253,13 @@ def demo_fn(args):
     plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
     plt.savefig("sample_image.png")
     
-    plt.figure()
-    plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
-    plt.savefig("sample_mask.png")
+    if masks is not None:
+        plt.figure()
+        plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
+        plt.savefig("sample_mask.png")
+        print("Saved sample mask visualization")
+    else:
+        print("No masks available for visualization")
     
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
@@ -333,8 +337,10 @@ def demo_fn(args):
     else:
         print("Using VGGT-predicted intrinsics for 3D point unprojection")
         intrinsic_for_unprojection = intrinsic
-        
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic_for_unprojection)
+    
+    if masks is not None:
+        print("Using masks to filter background points in depth map unprojection")  
+    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic_for_unprojection, masks)
     gpu_monitor.log_memory_stats("after VGGT inference")
     
     print(f"      Camera positions range: {np.min(extrinsic[:, :3, 3], axis=0)} to {np.max(extrinsic[:, :3, 3], axis=0)}")
@@ -359,11 +365,14 @@ def demo_fn(args):
             # You can also change the pred_tracks to tracks from any other methods
             # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
             images = images.to(device).to(dtype)
+            # if masks is not None:
+            #     print(f"TODO: Using masks for track prediction to filter background features")
+            # TODO: Masks are not used in the track prediction
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
                 images,
                 conf=depth_conf,
                 points_3d=points_3d,
-                masks=None,
+                masks=masks,
                 max_query_pts=args.max_query_pts,
                 query_frame_num=args.query_frame_num,
                 keypoint_extractor="aliked+sp",

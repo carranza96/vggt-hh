@@ -13,7 +13,7 @@ from vggt.dependency.distortion import apply_distortion, iterative_undistortion,
 
 
 def unproject_depth_map_to_point_map(
-    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
+    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray, masks: np.ndarray = None
 ) -> np.ndarray:
     """
     Unproject a batch of depth maps to 3D world coordinates.
@@ -22,6 +22,8 @@ def unproject_depth_map_to_point_map(
         depth_map (np.ndarray): Batch of depth maps of shape (S, H, W, 1) or (S, H, W)
         extrinsics_cam (np.ndarray): Batch of camera extrinsic matrices of shape (S, 3, 4)
         intrinsics_cam (np.ndarray): Batch of camera intrinsic matrices of shape (S, 3, 3)
+        masks (np.ndarray, optional): Batch of masks of shape (S, H, W) or (S, 1, H, W) to filter background. 
+                                    Values > 127 are considered foreground. If None, no masking is applied.
 
     Returns:
         np.ndarray: Batch of 3D world coordinates of shape (S, H, W, 3)
@@ -32,11 +34,21 @@ def unproject_depth_map_to_point_map(
         extrinsics_cam = extrinsics_cam.cpu().numpy()
     if isinstance(intrinsics_cam, torch.Tensor):
         intrinsics_cam = intrinsics_cam.cpu().numpy()
+    if masks is not None and isinstance(masks, torch.Tensor):
+        masks = masks.cpu().numpy()
 
     world_points_list = []
     for frame_idx in range(depth_map.shape[0]):
+        # Get mask for current frame if available
+        frame_mask = None
+        if masks is not None:
+            if masks.ndim == 4:  # (S, 1, H, W)
+                frame_mask = masks[frame_idx, 0]
+            else:  # (S, H, W)
+                frame_mask = masks[frame_idx]
+        
         cur_world_points, _, _ = depth_to_world_coords_points(
-            depth_map[frame_idx].squeeze(-1), extrinsics_cam[frame_idx], intrinsics_cam[frame_idx]
+            depth_map[frame_idx].squeeze(-1), extrinsics_cam[frame_idx], intrinsics_cam[frame_idx], mask=frame_mask
         )
         world_points_list.append(cur_world_points)
     world_points_array = np.stack(world_points_list, axis=0)
@@ -49,6 +61,7 @@ def depth_to_world_coords_points(
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
     eps=1e-8,
+    mask: np.ndarray = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert a depth map to world coordinates.
@@ -57,6 +70,8 @@ def depth_to_world_coords_points(
         depth_map (np.ndarray): Depth map of shape (H, W).
         intrinsic (np.ndarray): Camera intrinsic matrix of shape (3, 3).
         extrinsic (np.ndarray): Camera extrinsic matrix of shape (3, 4). OpenCV camera coordinate convention, cam from world.
+        eps (float): Minimum depth threshold for valid points.
+        mask (np.ndarray, optional): Mask of shape (H, W) to filter background. Values > 127 are considered foreground.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: World coordinates (H, W, 3) and valid depth mask (H, W).
@@ -66,6 +81,17 @@ def depth_to_world_coords_points(
 
     # Valid depth mask
     point_mask = depth_map > eps
+    
+    # Apply foreground mask if provided
+    if mask is not None:
+        # Convert mask to boolean: values > 127 (roughly half of 255) are considered foreground
+        foreground_mask = mask > 127
+        # Combine depth validity with foreground mask
+        point_mask = point_mask & foreground_mask
+        
+        # Zero out depth values for background pixels
+        depth_map = depth_map.copy()  # Don't modify the original
+        depth_map[~foreground_mask] = 0
 
     # Convert depth map to camera coordinates
     cam_coords_points = depth_to_cam_coords_points(depth_map, intrinsic)
