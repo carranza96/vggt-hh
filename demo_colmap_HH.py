@@ -341,6 +341,24 @@ def demo_fn(args):
     if masks is not None:
         print("Using masks to filter background points in depth map unprojection")  
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic_for_unprojection, masks)
+    
+    # Apply same mask filtering to depth confidence
+    if masks is not None:
+        print("Applying mask filtering to depth confidence")
+        depth_conf_masked = depth_conf.copy()
+        for i in range(len(masks)):
+            mask = masks[i]
+            if len(mask.shape) == 3 and mask.shape[0] == 1:
+                mask = mask[0]  # Remove channel dimension if present
+            
+            # Create foreground mask (values > 127 are foreground)
+            foreground_mask = mask > 127
+            # Zero out background confidence values
+            depth_conf_masked[i][~foreground_mask] = 0.0
+        
+        depth_conf = depth_conf_masked
+        print("Depth confidence filtered using masks")
+    
     gpu_monitor.log_memory_stats("after VGGT inference")
     
     print(f"      Camera positions range: {np.min(extrinsic[:, :3, 3], axis=0)} to {np.max(extrinsic[:, :3, 3], axis=0)}")
@@ -365,8 +383,6 @@ def demo_fn(args):
             # You can also change the pred_tracks to tracks from any other methods
             # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
             images = images.to(device).to(dtype)
-            # if masks is not None:
-            #     print(f"TODO: Using masks for track prediction to filter background features")
             # TODO: Masks are not used in the track prediction
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
                 images,
@@ -675,7 +691,7 @@ if __name__ == "__main__":
             self.fine_tracking = False
             
             # Non-BA parameters
-            self.conf_thres_value = 1.0
+            self.conf_thres_value = 5.0
             
             # Image loading parameters
             self.shared_camera = True

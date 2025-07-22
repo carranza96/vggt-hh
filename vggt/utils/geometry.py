@@ -88,10 +88,6 @@ def depth_to_world_coords_points(
         foreground_mask = mask > 127
         # Combine depth validity with foreground mask
         point_mask = point_mask & foreground_mask
-        
-        # Zero out depth values for background pixels
-        depth_map = depth_map.copy()  # Don't modify the original
-        depth_map[~foreground_mask] = 0
 
     # Convert depth map to camera coordinates
     cam_coords_points = depth_to_cam_coords_points(depth_map, intrinsic)
@@ -107,6 +103,9 @@ def depth_to_world_coords_points(
     world_coords_points = np.dot(cam_coords_points, R_cam_to_world.T) + t_cam_to_world  # HxWx3, 3x3 -> HxWx3
     # world_coords_points = np.einsum("ij,hwj->hwi", R_cam_to_world, cam_coords_points) + t_cam_to_world
 
+    # Set invalid points to (0, 0, 0) after transformation
+    world_coords_points[~point_mask] = 0.0
+    
     return world_coords_points, cam_coords_points, point_mask
 
 
