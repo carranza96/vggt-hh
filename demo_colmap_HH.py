@@ -30,6 +30,7 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.track_predict import predict_tracks
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
+from utils_hh import GPUMemoryMonitor, select_images, Tee
 import matplotlib.pyplot as plt
 # TODO: add support for masks
 # TODO: add iterative BA
@@ -158,6 +159,73 @@ def run_VGGT(model, images, dtype, resolution=518, maintain_aspect_ratio=False):
     return extrinsic, intrinsic, depth_map, depth_conf
 
 
+def inject_known_intrinsics(newK, original_coords, images_shape, depth_shape, 
+                           load_imgs_squared, img_load_resolution, num_images):
+    """
+    Helper function to inject known intrinsics with proper scaling.
+    """
+    print("Using known intrinsics for 3D point unprojection")
+    original_known_intrinsics = newK
+    
+    original_width, original_height = original_coords[0, -2:].cpu().numpy()
+    processed_height, processed_width = images_shape[-2:]
+    
+    print(f"Original image size: {original_height}x{original_width}")
+    print(f"Processed image size: {processed_height}x{processed_width}")
+    
+    # Calculate padding transformation
+    if load_imgs_squared and processed_height == processed_width:
+        if original_width < original_height:
+            padding_x = (original_height - original_width) / 2
+            padding_y = 0
+        else:
+            padding_x = 0
+            padding_y = (original_width - original_height) / 2
+    else:
+        padding_x = 0
+        padding_y = 0
+    
+    print(f"Padding: x={padding_x}, y={padding_y}")
+    
+    # Apply padding transformation
+    padded_intrinsics = original_known_intrinsics.copy()
+    padded_intrinsics[0, 2] += padding_x  # cx += padding_x
+    padded_intrinsics[1, 2] += padding_y  # cy += padding_y
+    
+    # Scale from padded size to processed size
+    if load_imgs_squared:
+        if original_width < original_height:
+            scale_factor = processed_width / original_height
+        else:
+            scale_factor = processed_height / original_width
+    else:
+        scale_factor = min(processed_width / original_width, processed_height / original_height)
+    
+    print(f"Original intrinsics:\n{original_known_intrinsics}")
+    print(f"Padding adjusted intrinsics:\n{padded_intrinsics}")
+    padded_intrinsics[:2, :] *= scale_factor  # Scale fx, fy, cx, cy
+    print(f"Scale factor for intrinsics: {scale_factor}")
+    print(f"Scaled padded intrinsics:\n{padded_intrinsics}")
+    
+    # Replicate for all frames
+    intrinsic_for_unprojection = np.tile(padded_intrinsics[None, :, :], (num_images, 1, 1))
+    
+    # Scale to match depth map resolution
+    depth_height, depth_width = depth_shape[1], depth_shape[2]
+    depth_scale_x = depth_width / processed_width
+    depth_scale_y = depth_height / processed_height
+    
+    intrinsic_for_unprojection[:, 0, 0] *= depth_scale_x  # fx
+    intrinsic_for_unprojection[:, 1, 1] *= depth_scale_y  # fy
+    intrinsic_for_unprojection[:, 0, 2] *= depth_scale_x  # cx
+    intrinsic_for_unprojection[:, 1, 2] *= depth_scale_y  # cy
+    
+    print(f"Final intrinsics for depth map ({depth_height}x{depth_width}):")
+    print(intrinsic_for_unprojection[0])
+    
+    return intrinsic_for_unprojection
+
+
 def demo_fn(args):
     # Initialize GPU memory monitor
     gpu_monitor = GPUMemoryMonitor()
@@ -265,82 +333,21 @@ def demo_fn(args):
     # Use aspect ratio preservation when not using squared loading
     maintain_aspect_ratio = not args.load_imgs_squared
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
+    
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
         # Use the camera matrix returned from loading function
         # This will be optimal matrix if undistortion was applied, otherwise original
         print(f"Using {'optimal' if args.undistort_images else 'original'} camera matrix from loading function as base intrinsics")
-        original_known_intrinsics = newK
-        
-        # Get original and processed image dimensions
-        original_width, original_height = original_coords[0, -2:].cpu().numpy()  # [1920, 1080]
-        # TODO: Revise what happens if img loading resolution is not same as vggt_fixed_resolution(hence depth_map)
-        processed_height, processed_width = images.shape[-2:]  # [1024, 1024] (padded square)
-        # processed_height, processed_width = depth_map.shape[1], depth_map.shape[2] (952,952)
-        
-        print(f"Original image size: {original_height}x{original_width}")
-        print(f"Processed image size: {processed_height}x{processed_width}")
-        
-        # Calculate padding transformation (same logic regardless of undistortion)
-        if processed_height == processed_width:  # Square padding
-            if original_width < original_height:
-                # Width was padded to match height
-                padding_x = (original_height - original_width) / 2
-                padding_y = 0
-            else:
-                # Height was padded to match width
-                padding_x = 0
-                padding_y = (original_width - original_height) / 2
-        else:
-            # No padding, just resize
-            padding_x = 0
-            padding_y = 0
-        
-        print(f"Padding: x={padding_x}, y={padding_y}")
-        
-        # Apply padding transformation to intrinsics
-        padded_intrinsics = original_known_intrinsics.copy()
-        padded_intrinsics[0, 2] += padding_x  # cx += padding_x
-        padded_intrinsics[1, 2] += padding_y  # cy += padding_y
-        
-        # Scale from padded size to processed size
-        if original_width < original_height:
-            # Padded to max(original_height) then resized to processed_width
-            scale_factor = processed_width / original_height
-        else:
-            scale_factor = processed_height / original_width
-        
-        print(f"Original intrinsics:\n{original_known_intrinsics}")
-        print(f"Padding adjusted intrinsics:\n{padded_intrinsics}")
-        padded_intrinsics[:2, :] *= scale_factor  # Scale fx, fy, cx, cy
-        print(f"Scale factor for intrinsics: {scale_factor}")
-        print(f"Scaled padded intrinsics:\n{padded_intrinsics}")
-        
-        # Replicate for all frames
-        intrinsic_for_unprojection = np.tile(padded_intrinsics[None, :, :], (len(images), 1, 1))
-        
-        # Finally, scale to match depth map resolution
-        depth_height, depth_width = depth_map.shape[1], depth_map.shape[2]
-        
-        depth_scale_x = depth_width / processed_width
-        depth_scale_y = depth_height / processed_height
-        
-        intrinsic_for_unprojection[:, 0, 0] *= depth_scale_x  # fx
-        intrinsic_for_unprojection[:, 1, 1] *= depth_scale_y  # fy
-        intrinsic_for_unprojection[:, 0, 2] *= depth_scale_x  # cx
-        intrinsic_for_unprojection[:, 1, 2] *= depth_scale_y  # cy
-        
-        print(f"Final intrinsics for depth map ({depth_height}x{depth_width}):")
-        print(intrinsic_for_unprojection[0])
-        
-        intrinsic = intrinsic_for_unprojection
+        intrinsic = inject_known_intrinsics(
+            newK, original_coords, images.shape, depth_map.shape, 
+            args.load_imgs_squared, img_load_resolution, len(images))
     else:
         print("Using VGGT-predicted intrinsics for 3D point unprojection")
-        intrinsic_for_unprojection = intrinsic
     
     if masks is not None:
         print("Using masks to filter background points in depth map unprojection")  
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic_for_unprojection, masks)
+    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
     
     # Apply same mask filtering to depth confidence
     if masks is not None:
@@ -577,95 +584,6 @@ def rename_colmap_recons_and_rescale_camera(
     return reconstruction
 
 
-def select_images(image_path_list, max_images=None, method="first"):
-    """
-    Select a subset of images from the full list based on the specified method.
-    
-    Args:
-        image_path_list: List of all image paths
-        max_images: Maximum number of images to select (None = use all)
-        method: Selection method ("first", "last", "uniform")
-        
-    Returns:
-        List of selected image paths
-    """
-    if max_images is None or max_images >= len(image_path_list):
-        print(f"Using all {len(image_path_list)} images")
-        return image_path_list
-    
-    if max_images <= 0:
-        raise ValueError("max_images must be positive")
-    
-    print(f"Selecting {max_images} images from {len(image_path_list)} total using method '{method}'")
-    
-    if method == "first":
-        selected = image_path_list[:max_images]
-    elif method == "last":
-        selected = image_path_list[-max_images:]
-    elif method == "uniform":
-        # Select uniformly spaced images
-        indices = np.linspace(0, len(image_path_list) - 1, max_images, dtype=int)
-        selected = [image_path_list[i] for i in indices]
-    else:
-        raise ValueError(f"Unknown selection method: {method}")
-    
-    print(f"Selected images ({method} method):")
-    for i, path in enumerate(selected[:10]):  # Show first 10
-        print(f"  {i}: {os.path.basename(path)}")
-    if len(selected) > 10:
-        print(f"  ... and {len(selected) - 10} more images")
-    
-    return selected
-
-
-# GPU Memory monitoring utilities
-class GPUMemoryMonitor:
-    def __init__(self):
-        self.max_memory_allocated = 0
-        self.max_memory_reserved = 0
-        self.initial_memory = 0
-        self.device_name = ""
-        
-        if torch.cuda.is_available():
-            self.device_name = torch.cuda.get_device_name()
-            self.initial_memory = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-    
-    def update_peak_memory(self):
-        if torch.cuda.is_available():
-            self.max_memory_allocated = max(self.max_memory_allocated, torch.cuda.max_memory_allocated())
-            self.max_memory_reserved = max(self.max_memory_reserved, torch.cuda.max_memory_reserved())
-    
-    def get_current_memory_mb(self):
-        if torch.cuda.is_available():
-            return torch.cuda.memory_allocated() / 1024 / 1024
-        return 0
-    
-    def get_peak_memory_mb(self):
-        self.update_peak_memory()
-        return self.max_memory_allocated / 1024 / 1024
-    
-    def get_peak_reserved_memory_mb(self):
-        self.update_peak_memory()
-        return self.max_memory_reserved / 1024 / 1024
-    
-    def log_memory_stats(self, stage=""):
-        if torch.cuda.is_available():
-            current_mb = self.get_current_memory_mb()
-            peak_mb = self.get_peak_memory_mb()
-            reserved_mb = self.get_peak_reserved_memory_mb()
-            
-            print(f"GPU Memory {stage}:")
-            print(f"  Device: {self.device_name}")
-            print(f"  Current: {current_mb:.1f} MB")
-            print(f"  Peak Allocated: {peak_mb:.1f} MB")
-            print(f"  Peak Reserved: {reserved_mb:.1f} MB")
-            return peak_mb, reserved_mb
-        else:
-            print(f"GPU Memory {stage}: CUDA not available")
-            return 0, 0
-
-
 if __name__ == "__main__":
     import os
     import sys
@@ -716,19 +634,6 @@ if __name__ == "__main__":
     os.makedirs(sparse_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(sparse_dir, f"reconstruction_log_{timestamp}.txt")
-    
-    # Simple tee class to write to both console and file
-    class Tee:
-        def __init__(self, file):
-            self.file = file
-            self.stdout = sys.stdout
-        def write(self, data):
-            self.file.write(data)
-            self.file.flush()
-            self.stdout.write(data)
-        def flush(self):
-            self.file.flush()
-            self.stdout.flush()
     
     # Execute with logging
     with open(log_file, 'w') as f:
