@@ -785,8 +785,8 @@ if __name__ == "__main__":
             self.camera_type = "PINHOLE"
             
             # Chunking parameters
-            self.chunk_size = 15
-            self.chunk_overlap = 5
+            self.chunk_size = 20
+            self.chunk_overlap = 10
             self.use_ba_per_chunk = True
             self.save_chunk_debug = False
             
