@@ -121,27 +121,21 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
         pil_imgs.append(img)
         pil_masks.append(alpha_mask)
 
-    # If any mask is present, compute min_y, max_y, min_x, max_x across all masks
-    min_y, max_y, min_x, max_x = None, None, None, None
+    # If any mask is present, compute min_y and max_y across all masks
+    min_y, max_y = None, None
     if any(m is not None for m in pil_masks):
         mask_arrays = [np.array(m) if m is not None else None for m in pil_masks]
         y_indices = []
-        x_indices = []
         for arr in mask_arrays:
             if arr is not None:
                 ys, xs = np.where(arr > 0)
                 if len(ys) > 0:
                     y_indices.append(ys)
-                if len(xs) > 0:
-                    x_indices.append(xs)
         if y_indices:
             min_y = min([ys.min() for ys in y_indices])
             max_y = max([ys.max() for ys in y_indices])
-        if x_indices:
-            min_x = min([xs.min() for xs in x_indices])
-            max_x = max([xs.max() for xs in x_indices])
 
-    # Second pass: process images and masks, apply vertical and horizontal crop if needed
+    # Second pass: process images and masks, apply vertical crop if needed
     for idx, (img, alpha_mask) in enumerate(zip(pil_imgs, pil_masks)):
         # Convert PIL image to numpy array for undistortion if needed
         if undistort_images:
@@ -155,32 +149,20 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
                 alpha_mask = Image.fromarray(alpha_array)
 
         # Apply vertical crop if min_y and max_y are set
-        crop_top, crop_bottom = 0, None
-        crop_left, crop_right = 0, None
-        width, height = img.size
         if min_y is not None and max_y is not None:
+            width, height = img.size
             crop_top = min_y
             crop_bottom = max_y + 1  # +1 to include max_y
-        else:
-            crop_bottom = height
-        if min_x is not None and max_x is not None:
-            crop_left = min_x
-            crop_right = max_x + 1  # +1 to include max_x
-        else:
-            crop_right = width
-        # Crop image if needed
-        if (crop_top != 0 or crop_bottom != height) or (crop_left != 0 or crop_right != width):
-            img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            img = img.crop((0, crop_top, width, crop_bottom))
             if alpha_mask is not None:
-                alpha_mask = alpha_mask.crop((crop_left, crop_top, crop_right, crop_bottom))
-            # Rectify intrinsics: principal point cy -= crop_top, cx -= crop_left
+                alpha_mask = alpha_mask.crop((0, crop_top, width, crop_bottom))
+            # Rectify intrinsics: principal point cy -= crop_top
             if idx == 0:
+                # Only rectify once, for all images
                 if undistort_images:
                     newK[1, 2] -= crop_top
-                    newK[0, 2] -= crop_left
                 else:
                     camera_matrix[1, 2] -= crop_top
-                    camera_matrix[0, 2] -= crop_left
 
         width, height = img.size
         max_dim = max(width, height)

@@ -1,3 +1,89 @@
+def umeyama_ransac(src_points, dst_points, threshold=0.05, max_trials=100, min_inliers=3, with_scale=True):
+    """Robust Umeyama alignment using RANSAC on point correspondences."""
+    assert src_points.shape == dst_points.shape and src_points.shape[1] == 3
+    n = src_points.shape[0]
+    best_inliers = []
+    best_R, best_t, best_scale = None, None, None
+    rng = np.random.default_rng()
+    for _ in range(max_trials):
+        # Randomly sample minimal set (3 for 3D similarity)
+        idx = rng.choice(n, 3, replace=False)
+        R, t, scale = umeyama_sim_transform(src_points[idx], dst_points[idx], with_scale=with_scale)
+        # Transform all src_points
+        src_aligned = (scale * (R @ src_points.T)).T + t
+        errors = np.linalg.norm(src_aligned - dst_points, axis=1)
+        inliers = np.where(errors < threshold)[0]
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_R, best_t, best_scale = R, t, scale
+        # Early exit if enough inliers
+        if len(best_inliers) >= n * 0.8:
+            break
+    if len(best_inliers) >= min_inliers:
+        # Re-estimate using all inliers
+        R, t, scale = umeyama_sim_transform(src_points[best_inliers], dst_points[best_inliers], with_scale=with_scale)
+        return R, t, scale, best_inliers
+    else:
+        # Fallback to all points
+        R, t, scale = umeyama_sim_transform(src_points, dst_points, with_scale=with_scale)
+        return R, t, scale, np.arange(n)
+
+import pickle
+import hashlib
+
+def compute_chunk_cache_key(chunk_paths, args):
+    """Compute a unique cache key for a chunk based on image names and key args."""
+    # Use image basenames and key parameters
+    key = {
+        'images': [os.path.basename(p) for p in chunk_paths],
+        'chunk_size': args.chunk_size,
+        'chunk_overlap': args.chunk_overlap,
+        'use_ba_per_chunk': args.use_ba_per_chunk,
+        'img_load_resolution': args.img_load_resolution,
+        'vggt_resolution': args.vggt_resolution,
+        'shared_camera': args.shared_camera,
+        'use_known_intrinsics': args.use_known_intrinsics,
+        'undistort_images': args.undistort_images,
+    }
+    # Use a stable hash (SHA256) for consistent cache keys across runs
+    key_bytes = pickle.dumps(key)
+    key_hash = hashlib.sha256(key_bytes).hexdigest()
+    return key_hash
+
+def get_chunk_cache_dir(args):
+    """Return the directory where chunk caches are stored."""
+    cache_dir = os.path.join(args.scene_dir, "chunk_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+def save_chunk_result_to_cache(chunk_result, chunk_cache_path):
+    # Save the reconstruction using pycolmap (if present)
+    recon = chunk_result.get('reconstruction', None)
+    if recon is not None:
+        recon_dir = chunk_cache_path + "_recon"
+        os.makedirs(recon_dir, exist_ok=True)
+        recon.write(recon_dir)
+        # Remove from dict to avoid pickle issues
+        chunk_result = dict(chunk_result)
+        chunk_result['reconstruction'] = None
+        chunk_result['reconstruction_dir'] = recon_dir
+    with open(chunk_cache_path, 'wb'):
+        pickle.dump(chunk_result, open(chunk_cache_path, 'wb'))
+
+def load_chunk_result_from_cache(chunk_cache_path):
+    with open(chunk_cache_path, 'rb') as f:
+        chunk_result = pickle.load(f)
+    # Load reconstruction if present
+    recon_dir = chunk_result.get('reconstruction_dir', None)
+    if recon_dir and os.path.exists(recon_dir):
+        try:
+            recon = pycolmap.Reconstruction()
+            recon.read(recon_dir)
+            chunk_result['reconstruction'] = recon
+        except Exception as e:
+            print(f"Warning: Failed to load reconstruction from {recon_dir}: {e}")
+            chunk_result['reconstruction'] = None
+    return chunk_result
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -186,11 +272,19 @@ def process_chunk(model, chunk_data, args, dtype, gpu_monitor, chunk_idx, newK=N
     """Process a single chunk of images and return reconstruction data."""
     chunk_paths = [item[0] for item in chunk_data]
     global_indices = [item[1] for item in chunk_data]
-    
+
+    # Persistent chunk cache
+    cache_dir = get_chunk_cache_dir(args)
+    cache_key = compute_chunk_cache_key(chunk_paths, args)
+    chunk_cache_path = os.path.join(cache_dir, f"chunk_{chunk_idx:03d}_{cache_key}.pkl")
+
+    if os.path.exists(chunk_cache_path):
+        print(f"\n=== Loading Chunk {chunk_idx + 1} from cache ===")
+        return load_chunk_result_from_cache(chunk_cache_path)
+
     print(f"\n=== Processing Chunk {chunk_idx + 1} ===")
     print(f"Images {global_indices[0]} to {global_indices[-1]} ({len(chunk_paths)} images)")
-    
-    # Load images for this chunk
+
     if args.load_imgs_squared:
         images, original_coords, chunk_newK, chunk_roi, masks = load_and_preprocess_images_square(
             chunk_paths, args.img_load_resolution, args.undistort_images)
@@ -199,26 +293,22 @@ def process_chunk(model, chunk_data, args, dtype, gpu_monitor, chunk_idx, newK=N
         images, original_coords, chunk_newK, chunk_roi, masks = load_and_preprocess_images_no_resize(
             chunk_paths, args.undistort_images)
         img_load_resolution = None
-    
+
     original_coords = original_coords.to(next(model.parameters()).device)
-    
-    # Run VGGT on this chunk
+
     maintain_aspect_ratio = not args.load_imgs_squared
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(
         model, images, dtype, args.vggt_resolution, maintain_aspect_ratio)
-    
-    # Handle intrinsics injection if needed
+
     if args.use_known_intrinsics and newK is not None:
         intrinsic = inject_known_intrinsics(
-            newK, original_coords, images.shape, depth_map.shape, 
+            newK, original_coords, images.shape, depth_map.shape,
             args.load_imgs_squared, img_load_resolution, len(images))
-    
-    # Unproject depth maps to 3D points
+
     if masks is not None:
         print("Using masks to filter background points")
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
-    
-    # Apply mask filtering to depth confidence
+
     if masks is not None:
         depth_conf_masked = depth_conf.copy()
         for i in range(len(masks)):
@@ -228,76 +318,72 @@ def process_chunk(model, chunk_data, args, dtype, gpu_monitor, chunk_idx, newK=N
             foreground_mask = mask > 127
             depth_conf_masked[i][~foreground_mask] = 0.0
         depth_conf = depth_conf_masked
-    
-    # Create reconstruction for this chunk
+
     reconstruction = None
-    
+
     if args.use_ba or args.use_ba_per_chunk:
-        # Run BA on this chunk
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / args.vggt_resolution if img_load_resolution else 1.0
-        
+
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images.to(next(model.parameters()).device).to(dtype)
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
                 images, conf=depth_conf, points_3d=points_3d, masks=masks,
                 max_query_pts=args.max_query_pts, query_frame_num=args.query_frame_num,
                 keypoint_extractor="aliked+sp", fine_tracking=args.fine_tracking)
-        
+
         intrinsic[:, :2, :] *= scale
         track_mask = pred_vis_scores > args.vis_thresh
-        
+
         reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
             points_3d, extrinsic, intrinsic, pred_tracks, image_size, masks=track_mask,
             max_reproj_error=args.max_reproj_error, shared_camera=args.shared_camera,
             camera_type=args.camera_type, points_rgb=points_rgb)
-        
+
         if reconstruction is not None and args.use_ba_per_chunk:
-            ba_options = pycolmap.BundleAdjustmentOptions()
+            ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False,
+            refine_principal_point=False,
+            refine_extra_params=False)
             pycolmap.bundle_adjustment(reconstruction, ba_options)
-        
+
         reconstruction_resolution = img_load_resolution
     else:
-        # No BA - use confidence thresholding
         num_frames, height, width, _ = points_3d.shape
         image_size = np.array([height, width])
         points_rgb = F.interpolate(images, size=(height, width), mode="bilinear", align_corners=False)
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
-        
+
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
         conf_mask = depth_conf >= args.conf_thres_value
         conf_mask = randomly_limit_trues(conf_mask, 100000)
-        
+
         points_3d = points_3d[conf_mask]
         points_xyf = points_xyf[conf_mask]
         points_rgb = points_rgb[conf_mask]
-        
+
         reconstruction = batch_np_matrix_to_pycolmap_wo_track(
             points_3d, points_xyf, points_rgb, extrinsic, intrinsic, image_size,
             shared_camera=args.shared_camera, camera_type="PINHOLE")
-        
+
         reconstruction_resolution = args.vggt_resolution
-    
-    # Rename and rescale camera parameters
+
     base_image_path_list = [os.path.basename(path) for path in chunk_paths]
-    
+
     if reconstruction is not None:
         reconstruction = rename_colmap_recons_and_rescale_camera(
             reconstruction, base_image_path_list, original_coords.cpu().numpy(),
             img_size=reconstruction_resolution, shift_point2d_to_original_res=True,
             shared_camera=args.shared_camera, use_known_intrinsics=args.use_known_intrinsics)
-    
+
     # Always save individual chunk reconstructions before alignment
     if reconstruction is not None:
         chunk_dir = os.path.join(args.scene_dir, f"chunks/chunk_{chunk_idx:03d}_before_alignment")
         os.makedirs(chunk_dir, exist_ok=True)
         sparse_dir = os.path.join(chunk_dir, "sparse/0")
         os.makedirs(sparse_dir, exist_ok=True)
-        
-        # Save in binary format
+
         reconstruction.write(sparse_dir)
-        
-        # Convert to text format
+
         try:
             text_cmd = f"colmap model_converter --input_path {sparse_dir} --output_path {sparse_dir} --output_type TXT"
             result = subprocess.run(text_cmd, shell=True, capture_output=True, text=True)
@@ -307,26 +393,28 @@ def process_chunk(model, chunk_data, args, dtype, gpu_monitor, chunk_idx, newK=N
                 print(f"  Warning: Failed to convert chunk {chunk_idx + 1} to text format")
         except Exception as e:
             print(f"  Warning: COLMAP text conversion failed for chunk {chunk_idx + 1}: {e}")
-        
-        # Save point cloud
+
         if len(points_3d.shape) == 4:
             flat_points = points_3d.reshape(-1, 3)
             flat_colors = points_rgb.reshape(-1, 3) if len(points_rgb.shape) == 4 else points_rgb
         else:
             flat_points, flat_colors = points_3d, points_rgb
-        
+
         trimesh.PointCloud(flat_points, colors=flat_colors).export(
             os.path.join(sparse_dir, "points.ply"))
-        
+
         print(f"  Saved chunk {chunk_idx + 1} reconstruction (before alignment) to {chunk_dir}")
-    
-    return {
+
+    # Save chunk result to cache (after all processing, including BA)
+    chunk_result = {
         'reconstruction': reconstruction,
         'points_3d': points_3d,
         'points_rgb': points_rgb,
         'chunk_paths': chunk_paths,
         'global_indices': global_indices
     }
+    save_chunk_result_to_cache(chunk_result, chunk_cache_path)
+    return chunk_result
 
 
 def umeyama_sim_transform(src, dst, with_scale=True):
@@ -555,21 +643,84 @@ def merge_chunk_reconstructions(chunk_results, args):
         if len(common_image_pairs) >= 3:
             src_positions, ref_positions = [], []
             
-            for src_img_id, merged_img_id in common_image_pairs:
-                for img_id, img_list, pos_list in [(src_img_id, [src_reconstruction], src_positions),
-                                                  (merged_img_id, [merged_reconstruction], ref_positions)]:
-                    image = img_list[0].images[img_id]
-                    rigid3d = image.cam_from_world
-                    R = Rotation.from_quat(rigid3d.rotation.quat).as_matrix()
-                    pos = -R.T @ rigid3d.translation
-                    pos_list.append(pos)
+            for src_img_id, merged_img_id in sorted(common_image_pairs):
+                src_image = src_reconstruction.images[src_img_id]
+                merged_image = merged_reconstruction.images[merged_img_id]
+                # Camera center calculation (COLMAP convention)
+                src_R = Rotation.from_quat(src_image.cam_from_world.rotation.quat).as_matrix()
+                src_t = src_image.cam_from_world.translation
+                src_center = -src_R.T @ src_t
+
+                merged_R = Rotation.from_quat(merged_image.cam_from_world.rotation.quat).as_matrix()
+                merged_t = merged_image.cam_from_world.translation
+                merged_center = -merged_R.T @ merged_t
+
+                src_positions.append(src_center)
+                ref_positions.append(merged_center)
             
             src_positions = np.array(src_positions)
             ref_positions = np.array(ref_positions)
+
+            # Eliminar los centros problemáticos en los índices 5 y 6 (índices base 0)
+            # remove_indices = [6]
+            # keep_indices = [i for i in range(len(src_positions)) if i not in remove_indices]
+            # src_positions = src_positions[keep_indices]
+            # ref_positions = ref_positions[keep_indices]
             
+
+            # Use RANSAC for robust alignment
+            # R, t, scale, inliers = umeyama_ransac(src_positions, ref_positions, threshold=0.05, max_trials=100, min_inliers=3, with_scale=True)
             R, t, scale = umeyama_sim_transform(src_positions, ref_positions, with_scale=True)
+            print(f"Scale: {scale:.4f}, Rotation:\n{R}\nTranslation: {t}")
+            
+            # Calcula error antes y después del alineamiento
+            src_centers_aligned = (scale * (R @ src_positions.T)).T + t
+            errors = np.linalg.norm(src_centers_aligned - ref_positions, axis=1)
+            print("Errores de alineamiento por imagen:", errors)
+            print("Error RMS:", np.sqrt(np.mean(errors**2)))
+            
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Todos los centros del chunk 0 (referencia)
+            all_ref_centers = []
+            for img_id, img in sorted(merged_reconstruction.images.items()):
+                Rm = Rotation.from_quat(img.cam_from_world.rotation.quat).as_matrix()
+                tm = img.cam_from_world.translation
+                center = -Rm.T @ tm
+                all_ref_centers.append(center)
+            all_ref_centers = np.array(all_ref_centers)
+            ax.scatter(all_ref_centers[:,0], all_ref_centers[:,1], all_ref_centers[:,2], c='blue', label='Chunk 0 (ref)', s=40)
+
+            # Todos los centros del chunk 1 (antes de alineamiento)
+            all_src_centers = []
+            for img_id, img in sorted(src_reconstruction.images.items()):
+                Rs = Rotation.from_quat(img.cam_from_world.rotation.quat).as_matrix()
+                ts = img.cam_from_world.translation
+                center = -Rs.T @ ts
+                all_src_centers.append(center)
+            all_src_centers = np.array(all_src_centers)#[:15]
+            ax.scatter(all_src_centers[:,0], all_src_centers[:,1], all_src_centers[:,2], c='green', label='Chunk 1 (src, antes)', s=40)
+
+            # Centros del chunk 1 después de alineamiento
+            all_src_centers_aligned = (scale * (R @ all_src_centers.T)).T + t
+            all_src_centers_aligned1 = all_src_centers_aligned[:10]
+            ax.scatter(all_src_centers_aligned1[:,0], all_src_centers_aligned1[:,1], all_src_centers_aligned1[:,2], c='red', label='Chunk 1 (src, alineado)', s=40)
+            all_src_centers_aligned2 = all_src_centers_aligned[10:]
+            ax.scatter(all_src_centers_aligned2[:,0], all_src_centers_aligned2[:,1], all_src_centers_aligned2[:,2], c='orange', label='Chunk 1 (src, alineado)', s=40)
+
+            ax.set_title('Centros de cámara: ref, src antes y src alineado')
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax.legend()
+            plt.tight_layout()
+            plt.savefig("centers_comparison.png")
+            
             apply_similarity_transform_to_reconstruction(src_reconstruction, scale, R, t)
-            print(f"  Applied Umeyama alignment (scale: {scale:.4f})")
+            # print(f"  Applied Umeyama RANSAC alignment (scale: {scale:.4f}, inliers: {len(inliers)}/{len(src_positions)})")
             
             # Save aligned chunk reconstruction
             save_aligned_chunk(src_reconstruction, chunk_idx, args)
@@ -582,6 +733,13 @@ def merge_chunk_reconstructions(chunk_results, args):
         
         # Save intermediate merged reconstruction after adding this chunk
         save_intermediate_merge(merged_reconstruction, chunk_idx, args)
+        
+        
+        # print("Running intermediate bundle adjustment...")
+        ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False,
+                    refine_principal_point=False,
+                    refine_extra_params=False)
+        pycolmap.bundle_adjustment(merged_reconstruction, ba_options)
     
     return merged_reconstruction
 
@@ -707,7 +865,9 @@ def demo_fn_chunked(args):
     # Final bundle adjustment
     if args.use_ba:
         print("Running final bundle adjustment...")
-        ba_options = pycolmap.BundleAdjustmentOptions()
+        ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False,
+            refine_principal_point=False,
+            refine_extra_params=False)
         pycolmap.bundle_adjustment(merged_reconstruction, ba_options)
     
     # Save final reconstruction
@@ -780,22 +940,22 @@ if __name__ == "__main__":
     
     class Args:
         def __init__(self):
-            self.scene_dir = "vggt-hh/dataset_vggt/Ob68/handheld"
+            self.scene_dir = "vggt-hh/dataset_vggt/Ob57/handheld"
             self.seed = 42
             self.camera_type = "PINHOLE"
             
             # Chunking parameters
-            self.chunk_size = 20
-            self.chunk_overlap = 10
+            self.chunk_size = 61
+            self.chunk_overlap = 20
             self.use_ba_per_chunk = True
             self.save_chunk_debug = False
             
             # Image selection parameters
-            self.max_images = 40
+            self.max_images = 130
             self.image_selection_method = "first"
             
             # BA parameters
-            self.use_ba = True
+            self.use_ba = False
             self.max_reproj_error = 8.0
             self.vis_thresh = 0.2
             self.query_frame_num = self.max_images
@@ -808,8 +968,8 @@ if __name__ == "__main__":
             self.sort_images = True
             self.use_known_intrinsics = True
             self.load_imgs_squared = True
-            self.img_load_resolution = 952
-            self.vggt_resolution = 952
+            self.img_load_resolution = 700
+            self.vggt_resolution = 700
             self.undistort_images = True
 
     args = Args()

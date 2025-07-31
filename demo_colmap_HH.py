@@ -80,10 +80,14 @@ def parse_args():
     parser.add_argument(
         "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
     )
+    parser.add_argument(
+        "--points_from_depth_map", action="store_true", default=True, 
+        help="Use depth map for unprojecting 3D points (default: True). Set to False to use point map"
+    )
     return parser.parse_args()
 
 
-def run_VGGT(model, images, dtype, resolution=518, maintain_aspect_ratio=False):
+def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=False):
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
@@ -125,11 +129,16 @@ def run_VGGT(model, images, dtype, resolution=518, maintain_aspect_ratio=False):
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, ps_idx = model.aggregator(images)
-            
+            aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks)
+        
         # Log memory after aggregator
         if torch.cuda.is_available():
             print(f"GPU memory after aggregator: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
+        torch.cuda.empty_cache()  # Clear cache to free up memory
+        # Move aggregated tokens to GPU
+        aggregated_tokens_list = [t.to('cuda') if i in [4,11,17,23] else t for i,t in enumerate(aggregated_tokens_list)]
+        # aggregated_tokens_list_fg = [t.to('cuda') if i in [23] else t for i,t in enumerate(aggregated_tokens_list_fg)]
+
 
         # Predict Cameras
         pose_enc = model.camera_head(aggregated_tokens_list)[-1]
@@ -139,9 +148,13 @@ def run_VGGT(model, images, dtype, resolution=518, maintain_aspect_ratio=False):
         # Log memory after camera prediction
         if torch.cuda.is_available():
             print(f"GPU memory after camera prediction: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
+        torch.cuda.empty_cache()  # Clear cache to free up memory
         
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+        
+        # Predict Point Maps
+        point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx)
         
         # Log memory after depth prediction
         if torch.cuda.is_available():
@@ -156,7 +169,7 @@ def run_VGGT(model, images, dtype, resolution=518, maintain_aspect_ratio=False):
     if torch.cuda.is_available():
         print(f"GPU memory after moving results to CPU: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
     
-    return extrinsic, intrinsic, depth_map, depth_conf
+    return extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf
 
 
 def inject_known_intrinsics(newK, original_coords, images_shape, depth_shape, 
@@ -332,7 +345,7 @@ def demo_fn(args):
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
     maintain_aspect_ratio = not args.load_imgs_squared
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
+    extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf = run_VGGT(model, images, masks, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
     
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
@@ -346,9 +359,13 @@ def demo_fn(args):
         print("Using VGGT-predicted intrinsics for 3D point unprojection")
     
     if masks is not None:
-        print("Using masks to filter background points in depth map unprojection")  
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
-    
+        print("Using masks to filter background points in depth map unprojection") 
+        
+    if args.points_from_depth_map:
+        points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
+    else:
+        points_3d = point_map.squeeze(0).cpu().numpy()
+        depth_conf = point_conf.squeeze(0).cpu().numpy()
     # Apply same mask filtering to depth confidence
     if masks is not None:
         print("Applying mask filtering to depth confidence")
@@ -365,6 +382,49 @@ def demo_fn(args):
         
         depth_conf = depth_conf_masked
         print("Depth confidence filtered using masks")
+    
+    # Save all plots for all images in one figure per image
+    plot_dir = os.path.join(args.scene_dir, "sparse/0/plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    num_images = images.shape[0]
+    for ind in range(num_images):
+        fig, axs = plt.subplots(2, 3, figsize=(18, 12))
+        # Image
+        axs[0, 0].set_title(f"Image [{ind}]")
+        axs[0, 0].imshow(images[ind].permute(1,2,0).cpu().numpy())
+        # Mask
+        axs[0, 1].set_title(f"Mask [{ind}]")
+        axs[0, 1].imshow(masks[ind].permute(1,2,0).cpu().numpy(), cmap="magma")
+        fig.colorbar(axs[0, 1].images[0], ax=axs[0, 1], fraction=0.046, pad=0.04, label="Mask")
+        axs[0, 1].axis('off')
+        # Depth
+        axs[0, 2].set_title(f"Depth [{ind}]")
+        im_depth = axs[0, 2].imshow(depth_map[ind], cmap="magma")
+        fig.colorbar(im_depth, ax=axs[0, 2], fraction=0.046, pad=0.04, label="Depth")
+        axs[0, 2].axis('off')
+        # Masked Depth
+        axs[1, 0].set_title(f"Depth Masked [{ind}]")
+        mask = masks[ind]
+        if len(mask.shape) == 3 and mask.shape[0] == 1:
+            mask = mask[0]
+        foreground_mask = mask > 127
+        depth_map_masked = copy.deepcopy(depth_map[ind])
+        depth_map_masked[~foreground_mask] = 0.0
+        im_depth_masked = axs[1, 0].imshow(depth_map_masked, cmap="magma")
+        fig.colorbar(im_depth_masked, ax=axs[1, 0], fraction=0.046, pad=0.04, label="Depth (masked)")
+        axs[1, 0].axis('off')
+        # Depth Confidence
+        axs[1, 1].set_title(f"Depth Conf [{ind}]")
+        im_conf = axs[1, 1].imshow(depth_conf[ind], cmap="magma")
+        fig.colorbar(im_conf, ax=axs[1, 1], fraction=0.046, pad=0.04, label="Depth Confidence")
+        axs[1, 1].axis('off')
+        # Empty plot for layout
+        axs[1, 2].axis('off')
+        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, f"plot_{ind:03d}.png"))
+        plt.close(fig)
+        if ind>10:
+            break
     
     gpu_monitor.log_memory_stats("after VGGT inference")
     
@@ -408,7 +468,6 @@ def demo_fn(args):
         # rescale the intrinsic matrix from 518 to target resolution
         intrinsic[:, :2, :] *= scale
         track_mask = pred_vis_scores > args.vis_thresh
-        print(f"Number of tracks after filtering: {np.sum(track_mask)}")
 
         # TODO: radial distortion, iterative BA, masks
         reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
@@ -428,7 +487,9 @@ def demo_fn(args):
             raise ValueError("No reconstruction can be built with BA")
 
         # Bundle Adjustment
-        ba_options = pycolmap.BundleAdjustmentOptions()
+        ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False,
+                                                       refine_principal_point=False,
+                                                       refine_extra_params=False)
         pycolmap.bundle_adjustment(reconstruction, ba_options)
         gpu_monitor.log_memory_stats("after bundle adjustment")
 
@@ -588,7 +649,7 @@ if __name__ == "__main__":
     import os
     import sys
     from datetime import datetime
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
     class Args:
         def __init__(self):
@@ -597,8 +658,8 @@ if __name__ == "__main__":
             self.camera_type = "PINHOLE"
 
             # Image selection parameters
-            self.max_images = 20  # Limit number of images
-            self.image_selection_method = "first"  # Options: first, last, uniform
+            self.max_images = 160  # Limit number of images
+            self.image_selection_method = "uniform"  # Options: first, last, uniform
             
             # BA parameters
             self.use_ba = True
@@ -609,17 +670,19 @@ if __name__ == "__main__":
             self.fine_tracking = False
             
             # Non-BA parameters
-            self.conf_thres_value = 5.0
+            self.conf_thres_value = 1.0
             
             # Image loading parameters
             self.shared_camera = True
             self.sort_images = True
             self.use_known_intrinsics = True  # Use known calibrated intrinsics
-            self.load_imgs_squared = True  # Use square padding and resize
-            self.img_load_resolution = 952  # Target resolution when using load_imgs_squared
-            self.vggt_resolution = 952  # VGGT model resolution
+            self.load_imgs_squared = True  # Use square padding
+            self.img_load_resolution = 518  # Target resolution when using load_imgs_squared
+            self.vggt_resolution = 518  # VGGT model resolution
             self.undistort_images = True  # Undistort images using known camera intrinsics
-            
+
+            # Depth map unprojection parameters
+            self.points_from_depth_map = True  # Use depth map for unprojecting 3D points, else use point map
 
     # For 24GB GPU:
     # With squared 518x518 -> max_images=117
