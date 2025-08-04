@@ -8,7 +8,7 @@ import numpy as np
 import pycolmap
 from .projection import project_3D_points_np
 
-# TODO: Share camera support?
+
 def batch_np_matrix_to_pycolmap(
     points3d,
     extrinsics,
@@ -51,14 +51,30 @@ def batch_np_matrix_to_pycolmap(
     assert len(points3d) == P
     assert image_size.shape[0] == 2
 
+    print(f"Total number of points: {P}")
+    min_frames = 2  # or your threshold
+
+    reproj_mask = None
+
     if max_reproj_error is not None:
         projected_points_2d, projected_points_cam = project_3D_points_np(points3d, extrinsics, intrinsics)
         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
         projected_points_2d[projected_points_cam[:, -1] <= 0] = 1e6
         reproj_mask = projected_diff < max_reproj_error
+        
+        points_passing_reproj = np.sum(np.sum(reproj_mask, axis=0) >= min_frames)
+        print(f"Unique points passing reproj_mask in at least {min_frames} frames: {points_passing_reproj}")
+
+    if masks is not None:
+        points_passing_masks = np.sum(np.sum(masks, axis=0) >= min_frames)
+        print(f"Unique points passing masks in at least {min_frames} frames: {points_passing_masks}")
+
 
     if masks is not None and reproj_mask is not None:
-        masks = np.logical_and(masks, reproj_mask)
+        combined_mask = np.logical_and(masks, reproj_mask)
+        points_passing_combined = np.sum(np.sum(combined_mask, axis=0) >= min_frames)
+        print(f"Unique points passing both masks and reproj_mask in at least {min_frames} frames: {points_passing_combined}")
+        masks = combined_mask
     elif masks is not None:
         masks = masks
     else:
@@ -76,7 +92,7 @@ def batch_np_matrix_to_pycolmap(
     inlier_num = masks.sum(0)
     valid_mask = inlier_num >= 2  # a track is invalid if without two inliers
     valid_idx = np.nonzero(valid_mask)[0]
-
+    print(f"Total number of valid points: {len(valid_idx)}")
     # Only add 3D points that have sufficient 2D points
     for vidx in valid_idx:
         # Use RGB colors if provided, otherwise use zeros
@@ -237,12 +253,10 @@ def batch_np_matrix_to_pycolmap_wo_track(
     for fidx in range(N):
         # set camera
         if camera is None or (not shared_camera):
-            intrinsic_idx = 0 if shared_camera else fidx
-            pycolmap_intri = _build_pycolmap_intri(intrinsic_idx, intrinsics, camera_type)
+            pycolmap_intri = _build_pycolmap_intri(fidx, intrinsics, camera_type)
 
             camera = pycolmap.Camera(
-                model=camera_type, width=image_size[0], height=image_size[1], 
-                params=pycolmap_intri, camera_id=1 if shared_camera else fidx + 1
+                model=camera_type, width=image_size[0], height=image_size[1], params=pycolmap_intri, camera_id=fidx + 1
             )
 
             # add camera
