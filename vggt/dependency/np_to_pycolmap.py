@@ -17,6 +17,7 @@ def batch_np_matrix_to_pycolmap(
     image_size,
     masks=None,
     max_reproj_error=None,
+    max_points3D=None,
     max_points3D_val=3000,
     shared_camera=False,
     camera_type="SIMPLE_PINHOLE",
@@ -93,6 +94,13 @@ def batch_np_matrix_to_pycolmap(
     valid_mask = inlier_num >= 2  # a track is invalid if without two inliers
     valid_idx = np.nonzero(valid_mask)[0]
     print(f"Total number of valid points: {len(valid_idx)}")
+    
+    # Randomly select a maximum of points
+    if max_points3D is not None and len(valid_idx) > max_points3D:
+        selected_indices = np.random.choice(valid_idx, size=max_points3D, replace=False)
+        valid_idx = np.sort(selected_indices)  # Sort to maintain some order
+        print(f"Randomly selected {max_points3D} points from {len(np.nonzero(valid_mask)[0])} valid points")
+
     # Only add 3D points that have sufficient 2D points
     for vidx in valid_idx:
         # Use RGB colors if provided, otherwise use zeros
