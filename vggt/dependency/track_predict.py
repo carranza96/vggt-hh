@@ -192,12 +192,12 @@ def _forward_on_query(
 
         # heuristic to remove low confidence points
         # should I export this as an input parameter?
-        valid_mask = pred_conf > 1.2
-        if valid_mask.sum() > 512:
-            query_points = query_points[:, valid_mask]  # Make sure shape is compatible
-            pred_conf = pred_conf[valid_mask]
-            pred_point_3d = pred_point_3d[valid_mask]
-            pred_color = pred_color[valid_mask]
+        valid_mask = pred_conf >= 1.2
+        # if valid_mask.sum() > 512:    # Ensure background points are not included
+        query_points = query_points[:, valid_mask]  # Make sure shape is compatible
+        pred_conf = pred_conf[valid_mask]
+        pred_point_3d = pred_point_3d[valid_mask]
+        pred_color = pred_color[valid_mask]
     else:
         pred_conf = None
         pred_point_3d = None
