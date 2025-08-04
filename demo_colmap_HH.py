@@ -611,11 +611,11 @@ if __name__ == "__main__":
     from datetime import datetime
     
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    object_name = "Ob73"
+    object_name = "Ob101"
     
     # Suggestions:
     # For quick testing, set image size to 518x518 and query_frame_num to 8
-    # For full experiments, use 952x952 and query_frame_num to 24
+    # For full experiments, use 952x952 and query_frame_num to 24 (max images=132 in 24GB GPU)
     # Remember to disable undistortion if working with undistorted images
     class Args:
         def __init__(self, object_name):
@@ -625,8 +625,8 @@ if __name__ == "__main__":
             self.experiment_dir = "sparse/0"  # Directory for saving results
 
             # Image selection parameters
-            self.max_images = None  # Limit number of images
-            self.image_selection_method = "uniform"  # If max_images is not None: Options: first, last, uniform
+            self.max_images = 132  # Limit number of images
+            self.image_selection_method = "uniform"  # If max_images is not None and lower than number of images: Options: first, last, uniform
 
             # Depth map unprojection parameters
             self.points_from_depth_map = False  # Use depth map for unprojecting 3D points, else use 3D points from point head
