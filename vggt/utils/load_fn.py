@@ -239,7 +239,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
     return images, original_coords, newK, roi, masks_tensor
 
 
-# TODO: Implement mask support
+# TODO: Adapt to new code
 def load_and_preprocess_images(image_path_list, mode="crop"):
     """
     A quick start function to load and preprocess images for model input.
@@ -285,11 +285,15 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         # Open image
         img = Image.open(image_path)
 
+        # If there's an alpha channel, blend onto white background:
         if img.mode == "RGBA":
-            r, g, b, a = img.split()
-            img = Image.merge("RGB", (r, g, b))
-        else:
-            img = img.convert("RGB")
+            # Create white background
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            # Alpha composite onto the white background
+            img = Image.alpha_composite(background, img)
+
+        # Now convert to "RGB" (this step assigns white for transparent areas)
+        img = img.convert("RGB")
 
         width, height = img.size
 
@@ -370,147 +374,3 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
             images = images.unsqueeze(0)
 
     return images
-
-
-def load_and_preprocess_images_no_resize(image_path_list, undistort_images=False):
-    """
-    Load images at their original resolution without any resizing or preprocessing.
-    
-    Args:
-        image_path_list (list): List of paths to image files
-        undistort_images (bool, optional): Whether to undistort images using known camera intrinsics. Defaults to False.
-        
-    Returns:
-        tuple: Always returns (
-            torch.Tensor: Batched tensor of images with shape (N, 3, H, W),
-            torch.Tensor: Array of shape (N, 6) containing [0, 0, W, H, W, H] for each image,
-            numpy.ndarray: Camera matrix (3, 3) - optimal matrix if undistorted, original if not,
-            tuple: ROI coordinates (x, y, w, h) - optimal ROI if undistorted, (0, 0, width, height) if not,
-            torch.Tensor or None: Alpha masks with shape (N, 1, H, W) if present, None otherwise
-        )
-    """
-    if len(image_path_list) == 0:
-        raise ValueError("At least 1 image is required")
-    
-    # Get camera calibration constants
-    camera_matrix, dist_coeffs = get_camera_intrinsics_for_undistortion()
-    
-    # Initialize return values
-    newK = camera_matrix.copy()  # Default to original camera matrix
-    roi = None  # Will be set later
-    
-    # Pre-calculate optimal camera matrix and ROI if undistortion is enabled
-    if undistort_images:
-        # Use first image to get dimensions (assuming all images have same shape)
-        sample_img = Image.open(image_path_list[0])
-        sample_width, sample_height = sample_img.size
-        
-        # Adjust principal point for OpenCV undistortion (top-left corner convention)
-        camera_matrix[0, 2] -= 0.5  # cx
-        camera_matrix[1, 2] -= 0.5  # cy
-        
-        # Calculate optimal new camera matrix and ROI
-        newK, roi = cv2.getOptimalNewCameraMatrix(
-            camera_matrix, dist_coeffs, 
-            (sample_width, sample_height), 0  # alpha=0 for maximum valid pixels
-        )
-        x, y, w, h = roi
-        
-        # Calculate undistortion maps
-        map1, map2 = cv2.initUndistortRectifyMap(
-            camera_matrix, dist_coeffs, None, newK, 
-            (sample_width, sample_height), cv2.CV_16SC2
-        )
-        
-        print(f"Optimal undistortion ROI: ({x}, {y}, {w}, {h})")
-        print(f"New camera matrix:\n{newK}")
-    else:
-        # For non-undistorted images, set ROI based on first image dimensions
-        sample_img = Image.open(image_path_list[0])
-        sample_width, sample_height = sample_img.size
-        roi = (0, 0, sample_width, sample_height)
-    
-    images = []
-    masks = []
-    has_alpha = False
-    original_coords = []
-    to_tensor = TF.ToTensor()
-    
-    for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
-        
-        # Handle alpha channel
-        alpha_mask = None
-        if img.mode == "RGBA":
-            r, g, b, a = img.split()
-            img = Image.merge("RGB", (r, g, b))
-            alpha_mask = a
-            has_alpha = True
-        else:
-            img = img.convert("RGB")
-        
-        # Convert PIL image to numpy array for undistortion if needed
-        if undistort_images:
-            # Convert PIL to numpy array (OpenCV format: BGR)
-            img_array = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            
-            # Apply undistortion using pre-computed maps
-            img_array = cv2.remap(img_array, map1, map2, interpolation=cv2.INTER_CUBIC)
-            # Crop to ROI (consistent across all images)
-            x, y, w, h = roi
-            img_array = img_array[y:y+h, x:x+w]
-            
-            # Convert back to PIL (RGB format)
-            img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
-
-            # Process alpha mask if present
-            if alpha_mask is not None:
-                # Apply undistortion to alpha mask using nearest neighbor to preserve binary values
-                alpha_array = cv2.remap(np.array(alpha_mask), map1, map2, interpolation=cv2.INTER_NEAREST)
-                # Crop to ROI
-                alpha_array = alpha_array[y:y+h, x:x+w]
-                alpha_mask = Image.fromarray(alpha_array)
-        
-        original_width, original_height = img.size
-        
-        # Convert to tensor without any resizing
-        img_tensor = to_tensor(img)
-        images.append(img_tensor)
-        
-        # Process alpha mask if present
-        if alpha_mask is not None:
-            # Convert to tensor preserving original [0, 255] range
-            alpha_tensor = torch.from_numpy(np.array(alpha_mask)).unsqueeze(0)
-            masks.append(alpha_tensor)
-        else:
-            # Create a fully opaque mask for images without alpha
-            alpha_tensor = torch.ones((1, original_height, original_width)) * 255
-            masks.append(alpha_tensor)
-        
-        # Store coordinates: [x1, y1, x2, y2, original_width, original_height]
-        # Since no resizing, the image occupies the full tensor
-        original_coords.append(np.array([0, 0, original_width, original_height, original_width, original_height]))
-    
-    # Stack images (they should all have the same size)
-    images = torch.stack(images)
-    original_coords = torch.from_numpy(np.array(original_coords)).float()
-    
-    # Stack alpha masks if any images had alpha channels
-    masks_tensor = None
-    if has_alpha:
-        masks_tensor = torch.stack(masks)
-
-    # Update camera matrix after all processing is complete
-    if undistort_images:
-        # Update the principal point based on our cropped region of interest (ROI)
-        x, y, w, h = roi
-        newK[0, 2] -= x
-        newK[1, 2] -= y
-        
-        # Restore pixel center convention (add back the 0.5 we subtracted earlier)
-        newK[0, 2] += 0.5
-        newK[1, 2] += 0.5
-
-    # Always return the same 5 values
-    return images, original_coords, newK, roi, masks_tensor

@@ -39,32 +39,12 @@ import matplotlib.pyplot as plt
 # TODO: test different camera types
 
 
+# This function is not used in this script
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Demo")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
-    ######### Image loading parameters #########
-    parser.add_argument("--sort_images", action="store_true", default=False, 
-                       help="Sort images by filename (default: unsorted for better diversity)")
-    parser.add_argument("--use_known_intrinsics", action="store_true", default=False,
-                       help="Use known calibrated intrinsics instead of VGGT predictions")
-    parser.add_argument("--load_imgs_squared", action="store_true", default=True,
-                       help="Load images with square padding and resizing (default: True). Use --no-load_imgs_squared for original resolution")
-    parser.add_argument("--img_load_resolution", type=int, default=1024,
-                       help="Target resolution for image loading when --load_imgs_squared is True")
-    parser.add_argument("--vggt_resolution", type=int, default=518,
-                       help="Resolution used by VGGT model (default: 518)")
-    parser.add_argument("--undistort_images", action="store_true", default=False,
-                       help="Undistort images using known camera intrinsics before processing")
-    
-    ######### Image selection parameters #########
-    parser.add_argument("--max_images", type=int, default=None,
-                       help="Maximum number of images to use (default: use all images)")
-    parser.add_argument("--image_selection_method", type=str, default="first", 
-                       choices=["first", "last", "uniform"],
-                       help="Method for selecting images: 'first' (first N), 'last' (last N), 'uniform' (uniformly spaced)")
-    
     ######### BA parameters #########
     parser.add_argument(
         "--max_reproj_error", type=float, default=8.0, help="Maximum reprojection error for reconstruction"
@@ -79,10 +59,6 @@ def parse_args():
     )
     parser.add_argument(
         "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
-    )
-    parser.add_argument(
-        "--points_from_depth_map", action="store_true", default=True, 
-        help="Use depth map for unprojecting 3D points (default: True). Set to False to use point map"
     )
     return parser.parse_args()
 
@@ -118,10 +94,6 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
     device = next(model.parameters()).device
     images = images.to(device)
     
-    plt.figure()
-    plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
-    plt.savefig("sample_image_vggt.png")
-    
     # Log memory before inference
     if torch.cuda.is_available():
         print(f"GPU memory before VGGT inference: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
@@ -129,16 +101,15 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks)
+            aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks, random_fg=args.random_fg)
+        torch.cuda.empty_cache()  
+        # Move aggregated tokens to GPU
+        aggregated_tokens_list = [t.to('cuda') if i in [4,11,17,23] else t for i,t in enumerate(aggregated_tokens_list)]
+        # aggregated_tokens_list_fg = [t.to('cuda') if i in [23] else t for i,t in enumerate(aggregated_tokens_list_fg)]
         
         # Log memory after aggregator
         if torch.cuda.is_available():
             print(f"GPU memory after aggregator: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
-        torch.cuda.empty_cache()  # Clear cache to free up memory
-        # Move aggregated tokens to GPU
-        aggregated_tokens_list = [t.to('cuda') if i in [4,11,17,23] else t for i,t in enumerate(aggregated_tokens_list)]
-        # aggregated_tokens_list_fg = [t.to('cuda') if i in [23] else t for i,t in enumerate(aggregated_tokens_list_fg)]
-
 
         # Predict Cameras
         pose_enc = model.camera_head(aggregated_tokens_list)[-1]
@@ -148,7 +119,7 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
         # Log memory after camera prediction
         if torch.cuda.is_available():
             print(f"GPU memory after camera prediction: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
-        torch.cuda.empty_cache()  # Clear cache to free up memory
+        torch.cuda.empty_cache()
         
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
@@ -164,11 +135,6 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
     depth_map = depth_map.squeeze(0).cpu().numpy()
     depth_conf = depth_conf.squeeze(0).cpu().numpy()
-    
-    # Log memory after moving to CPU
-    if torch.cuda.is_available():
-        print(f"GPU memory after moving results to CPU: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
-    
     return extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf
 
 
@@ -257,10 +223,9 @@ def demo_fn(args):
         torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
     print(f"Setting seed as: {args.seed}")
 
-    # Set device and dtype: bfloat16 causes OOM error in my GPU (RTX 3090)
+    # Set device and dtype to float16. bfloat16 causes OOM error in my GPU (RTX 3090)
     # dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     dtype = torch.float16
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Using dtype: {dtype}")
@@ -272,13 +237,11 @@ def demo_fn(args):
     model.eval()
     model = model.to(device)
     model = model.to(dtype)
-
     print(f"Model loaded")
     gpu_monitor.log_memory_stats("after model loading")
 
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
-    
     # Load images with optional sorting
     if args.sort_images:
         print("Loading images with sorting (temporal order)")
@@ -286,7 +249,6 @@ def demo_fn(args):
     else:
         print("Loading images without sorting (potentially better diversity)")
         image_path_list = glob.glob(os.path.join(image_dir, "*"))
-
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
     
@@ -328,19 +290,18 @@ def demo_fn(args):
         img_load_resolution = None  # Variable resolution
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir} with shape {images.shape}")
-    gpu_monitor.log_memory_stats("after image loading")
 
-    plt.figure()
-    plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
-    plt.savefig("sample_image.png")
-    
-    if masks is not None:
+    if args.debugging_plots:
         plt.figure()
-        plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
-        plt.savefig("sample_mask.png")
-        print("Saved sample mask visualization")
-    else:
-        print("No masks available for visualization")
+        plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
+        plt.savefig("sample_image.png")
+        if masks is not None:
+            plt.figure()
+            plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
+            plt.savefig("sample_mask.png")
+            print("Saved sample mask visualization")
+        else:
+            print("No masks available for visualization")
     
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
@@ -383,48 +344,48 @@ def demo_fn(args):
         depth_conf = depth_conf_masked
         print("Depth confidence filtered using masks")
     
-    # Save all plots for all images in one figure per image
-    plot_dir = os.path.join(args.scene_dir, "sparse/0/plots")
-    os.makedirs(plot_dir, exist_ok=True)
-    num_images = images.shape[0]
-    for ind in range(num_images):
-        fig, axs = plt.subplots(2, 3, figsize=(18, 12))
-        # Image
-        axs[0, 0].set_title(f"Image [{ind}]")
-        axs[0, 0].imshow(images[ind].permute(1,2,0).cpu().numpy())
-        # Mask
-        axs[0, 1].set_title(f"Mask [{ind}]")
-        axs[0, 1].imshow(masks[ind].permute(1,2,0).cpu().numpy(), cmap="magma")
-        fig.colorbar(axs[0, 1].images[0], ax=axs[0, 1], fraction=0.046, pad=0.04, label="Mask")
-        axs[0, 1].axis('off')
-        # Depth
-        axs[0, 2].set_title(f"Depth [{ind}]")
-        im_depth = axs[0, 2].imshow(depth_map[ind], cmap="magma")
-        fig.colorbar(im_depth, ax=axs[0, 2], fraction=0.046, pad=0.04, label="Depth")
-        axs[0, 2].axis('off')
-        # Masked Depth
-        axs[1, 0].set_title(f"Depth Masked [{ind}]")
-        mask = masks[ind]
-        if len(mask.shape) == 3 and mask.shape[0] == 1:
-            mask = mask[0]
-        foreground_mask = mask > 127
-        depth_map_masked = copy.deepcopy(depth_map[ind])
-        depth_map_masked[~foreground_mask] = 0.0
-        im_depth_masked = axs[1, 0].imshow(depth_map_masked, cmap="magma")
-        fig.colorbar(im_depth_masked, ax=axs[1, 0], fraction=0.046, pad=0.04, label="Depth (masked)")
-        axs[1, 0].axis('off')
-        # Depth Confidence
-        axs[1, 1].set_title(f"Depth Conf [{ind}]")
-        im_conf = axs[1, 1].imshow(depth_conf[ind], cmap="magma")
-        fig.colorbar(im_conf, ax=axs[1, 1], fraction=0.046, pad=0.04, label="Depth Confidence")
-        axs[1, 1].axis('off')
-        # Empty plot for layout
-        axs[1, 2].axis('off')
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, f"plot_{ind:03d}.png"))
-        plt.close(fig)
-        if ind>10:
-            break
+    if args.debugging_plots:
+        plot_dir = os.path.join(args.scene_dir, args.experiment_dir, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        num_images = images.shape[0]
+        for ind in range(num_images):
+            fig, axs = plt.subplots(2, 3, figsize=(18, 12))
+            # Image
+            axs[0, 0].set_title(f"Image [{ind}]")
+            axs[0, 0].imshow(images[ind].permute(1,2,0).cpu().numpy())
+            # Mask
+            axs[0, 1].set_title(f"Mask [{ind}]")
+            axs[0, 1].imshow(masks[ind].permute(1,2,0).cpu().numpy(), cmap="magma")
+            fig.colorbar(axs[0, 1].images[0], ax=axs[0, 1], fraction=0.046, pad=0.04, label="Mask")
+            axs[0, 1].axis('off')
+            # Depth
+            axs[0, 2].set_title(f"Depth [{ind}]")
+            im_depth = axs[0, 2].imshow(depth_map[ind], cmap="magma")
+            fig.colorbar(im_depth, ax=axs[0, 2], fraction=0.046, pad=0.04, label="Depth")
+            axs[0, 2].axis('off')
+            # Masked Depth
+            axs[1, 0].set_title(f"Depth Masked [{ind}]")
+            mask = masks[ind]
+            if len(mask.shape) == 3 and mask.shape[0] == 1:
+                mask = mask[0]
+            foreground_mask = mask > 127
+            depth_map_masked = copy.deepcopy(depth_map[ind])
+            depth_map_masked[~foreground_mask] = 0.0
+            im_depth_masked = axs[1, 0].imshow(depth_map_masked, cmap="magma")
+            fig.colorbar(im_depth_masked, ax=axs[1, 0], fraction=0.046, pad=0.04, label="Depth (masked)")
+            axs[1, 0].axis('off')
+            # Depth Confidence
+            axs[1, 1].set_title(f"Depth Conf [{ind}]")
+            im_conf = axs[1, 1].imshow(depth_conf[ind], cmap="magma")
+            fig.colorbar(im_conf, ax=axs[1, 1], fraction=0.046, pad=0.04, label="Depth Confidence")
+            axs[1, 1].axis('off')
+            # Empty plot for layout
+            axs[1, 2].axis('off')
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, f"plot_{ind:03d}.png"))
+            plt.close(fig)
+            if ind>10:
+                break
     
     gpu_monitor.log_memory_stats("after VGGT inference")
     
@@ -440,7 +401,7 @@ def demo_fn(args):
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / vggt_fixed_resolution
         shared_camera = args.shared_camera
-        
+
         with torch.cuda.amp.autocast(dtype=dtype):
             # Predicting Tracks
             # Using VGGSfM tracker instead of VGGT tracker for efficiency
@@ -465,7 +426,7 @@ def demo_fn(args):
             torch.cuda.empty_cache()
             gpu_monitor.log_memory_stats("after track prediction")
 
-        # rescale the intrinsic matrix from 518 to target resolution
+        # rescale the intrinsic matrix from vggt_fixed_resolution to img_load_resolution
         intrinsic[:, :2, :] *= scale
         track_mask = pred_vis_scores > args.vis_thresh
 
@@ -478,6 +439,7 @@ def demo_fn(args):
             image_size,
             masks=track_mask,
             max_reproj_error=args.max_reproj_error,
+            max_points3D=args.max_points_for_colmap,
             shared_camera=shared_camera,
             camera_type=args.camera_type,
             points_rgb=points_rgb,
@@ -487,9 +449,7 @@ def demo_fn(args):
             raise ValueError("No reconstruction can be built with BA")
 
         # Bundle Adjustment
-        ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False,
-                                                       refine_principal_point=False,
-                                                       refine_extra_params=False)
+        ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False, refine_principal_point=False,refine_extra_params=False)
         pycolmap.bundle_adjustment(reconstruction, ba_options)
         gpu_monitor.log_memory_stats("after bundle adjustment")
 
@@ -546,29 +506,30 @@ def demo_fn(args):
         use_known_intrinsics=args.use_known_intrinsics,
     )
 
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse/0")
+    print(f"Saving reconstruction to {args.scene_dir}/{args.experiment_dir}")
+    sparse_reconstruction_dir = os.path.join(args.scene_dir, args.experiment_dir)
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
     reconstruction.write(sparse_reconstruction_dir)
 
     # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/0/points.ply"))
+    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, args.experiment_dir, "points.ply"))
 
     # Convert COLMAP model from binary to text format
-    print("Converting COLMAP model to text format...")
-    colmap_cmd = f"colmap model_converter --input_path {sparse_reconstruction_dir} --output_path {sparse_reconstruction_dir} --output_type TXT"
-    print(f"Running: {colmap_cmd}")
-    
-    import subprocess
-    try:
-        result = subprocess.run(colmap_cmd, shell=True, capture_output=True, text=True, cwd=os.getcwd())
-        if result.returncode == 0:
-            print("Successfully converted COLMAP model to text format")
-        else:
-            print(f"Warning: COLMAP conversion failed with return code {result.returncode}")
-            print(f"Error output: {result.stderr}")
-    except Exception as e:
-        print(f"Warning: Failed to run COLMAP converter: {e}")
+    if args.save_colmap_txt:
+        print("Converting COLMAP model to text format...")
+        colmap_cmd = f"colmap model_converter --input_path {sparse_reconstruction_dir} --output_path {sparse_reconstruction_dir} --output_type TXT"
+        print(f"Running: {colmap_cmd}")
+
+        import subprocess
+        try:
+            result = subprocess.run(colmap_cmd, shell=True, capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                print("Successfully converted COLMAP model to text format")
+            else:
+                print(f"Warning: COLMAP conversion failed with return code {result.returncode}")
+                print(f"Error output: {result.stderr}")
+        except Exception as e:
+            print(f"Warning: Failed to run COLMAP converter: {e}")
 
     # Final memory logging
     gpu_monitor.log_memory_stats("at completion")
@@ -646,54 +607,68 @@ def rename_colmap_recons_and_rescale_camera(
 
 
 if __name__ == "__main__":
-    import os
     import sys
     from datetime import datetime
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    object_name = "Ob73"
+    
+    # Suggestions:
+    # For quick testing, set image size to 518x518 and query_frame_num to 8
+    # For full experiments, use 952x952 and query_frame_num to 24
+    # Remember to disable undistortion if working with undistorted images
     class Args:
-        def __init__(self):
-            self.scene_dir = "vggt-hh/dataset_vggt/Ob68/handheld"  # Update this path
+        def __init__(self, object_name):
+            self.scene_dir = f"vggt-hh/dataset_vggt/{object_name}/handheld"  # Update this path
             self.seed = 42
             self.camera_type = "PINHOLE"
+            self.experiment_dir = "sparse/0"  # Directory for saving results
 
             # Image selection parameters
-            self.max_images = 160  # Limit number of images
-            self.image_selection_method = "uniform"  # Options: first, last, uniform
-            
-            # BA parameters
-            self.use_ba = True
-            self.max_reproj_error = 8.0
-            self.vis_thresh = 0.2
-            self.query_frame_num = self.max_images
-            self.max_query_pts = 4096
-            self.fine_tracking = False
-            
-            # Non-BA parameters
-            self.conf_thres_value = 1.0
-            
-            # Image loading parameters
-            self.shared_camera = True
-            self.sort_images = True
-            self.use_known_intrinsics = True  # Use known calibrated intrinsics
-            self.load_imgs_squared = True  # Use square padding
-            self.img_load_resolution = 518  # Target resolution when using load_imgs_squared
-            self.vggt_resolution = 518  # VGGT model resolution
-            self.undistort_images = True  # Undistort images using known camera intrinsics
+            self.max_images = None  # Limit number of images
+            self.image_selection_method = "uniform"  # If max_images is not None: Options: first, last, uniform
 
             # Depth map unprojection parameters
-            self.points_from_depth_map = True  # Use depth map for unprojecting 3D points, else use point map
+            self.points_from_depth_map = False  # Use depth map for unprojecting 3D points, else use 3D points from point head
+            
+            # BA parameters
+            self.use_ba = True 
+            self.max_reproj_error = 8.0 if self.points_from_depth_map else None # Only use max_reproj_error if using depth map. Disable for point map
+            self.vis_thresh = 0.2   # TODO: Explore: Maybe increase this threshold? Default was 0.2 for depth map points.
+            #TODO: Query_frame_num is important. Higher values (or using all images) will give more points and better results at the cost of speed. But if using all images, results can have more than 500k points.
+            # Default is 8, but setting it to 24 for instance can improve results. If you get error "No reconstruction can be built with BA" then try to increase this value.
+            self.query_frame_num = 24   
+            self.max_query_pts = 4096
+            self.fine_tracking = False
+            # If necessary to speed up experiments limit to, for instance, 10k points for COLMAP reconstruction and BA. 
+            # If query_frame_num is high: 3D points from point map and tracks are very dense, and using all makes BA and writing to disk very slow 
+            self.max_points_for_colmap = None #10000  
+            
+            # Non-BA parameters
+            self.conf_thres_value = 1.0 # Not used if use_ba is True
+            
+            # Image loading parameters
+            self.sort_images = True
+            self.use_known_intrinsics = True  # Used known calibrated intrinsics
+            self.shared_camera = True if self.use_known_intrinsics else False 
+            self.load_imgs_squared = True  # Use square padding
+            # TODO: Image resolution: Use 952x952, 700x700 or 518x518? Using 952x952 if speed is reasonable
+            self.img_load_resolution = 952  # Target resolution when using load_imgs_squared
+            self.vggt_resolution = self.img_load_resolution  # VGGT model resolution
+            
+            self.undistort_images = True  # TODO: Musa should disable this.
+            
+            # Aggregator (attention block) parameters
+            self.random_fg = True  # Use random foreground tokens for attention, else use first N tokens.
+            
+            # Debugging parameters
+            self.debugging_plots = False
+            self.save_colmap_txt = False  # Save COLMAP model in text format
 
-    # For 24GB GPU:
-    # With squared 518x518 -> max_images=117
-    # With squared 700x700 -> max_images=61
-    # With squared 952x952 -> max_images=28
-    # With non-squared 952x532 -> max_images=62
+    args = Args(object_name)
 
-    args = Args()
-    
     # Set up logging
-    sparse_dir = os.path.join(args.scene_dir, "sparse/0")
+    sparse_dir = os.path.join(args.scene_dir, args.experiment_dir)
     os.makedirs(sparse_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(sparse_dir, f"reconstruction_log_{timestamp}.txt")
