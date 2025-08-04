@@ -181,11 +181,12 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor, masks: torch.Tensor=None) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, masks: torch.Tensor=None, random_fg: bool=False) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            random_fg (bool): Whether to randomly select N_fg foreground patches instead of taking the first N_fg
 
         Returns:
             (list[torch.Tensor], int):
@@ -214,6 +215,7 @@ class Aggregator(nn.Module):
 
 
         selected_indices_list = []
+        perm_list = []  # Store permutations for consistent random_fg selection
         patch_mask_fullgrid = None
         N_fg = None
         if masks is not None:
@@ -237,7 +239,8 @@ class Aggregator(nn.Module):
             patch_size = self.patch_size
             mask_patches = F.unfold(masks_bin.unsqueeze(1), kernel_size=patch_size, stride=patch_size)
             mask_patches = mask_patches.transpose(1,2)
-            patch_mask_fullgrid = mask_patches.max(dim=-1)[0] > 0.5  # True if any pixel is foreground
+            # TODO: Higher thresholding might be needed for better foreground detection
+            patch_mask_fullgrid = mask_patches.max(dim=-1)[0] > 0.5  # True if any pixel is foreground. 
 
             # Find minimum number of foreground patches across all images
             fg_counts = [torch.sum(patch_mask_fullgrid[i]).item() for i in range(patch_mask_fullgrid.shape[0])]
@@ -249,10 +252,17 @@ class Aggregator(nn.Module):
             for i in range(patch_tokens.shape[0]):
                 fg_idx = torch.where(patch_mask_fullgrid[i])[0]
                 if len(fg_idx) >= N_fg:
-                    selected_idx = fg_idx[:N_fg]
+                    if random_fg:
+                        perm = torch.randperm(len(fg_idx), device=fg_idx.device)
+                        selected_idx = fg_idx[perm[:N_fg]]
+                        perm_list.append(perm)
+                    else:
+                        selected_idx = fg_idx[:N_fg]
+                        perm_list.append(None)
                 else:
                     pad_len = N_fg - len(fg_idx)
                     selected_idx = torch.cat([fg_idx, fg_idx.new_zeros(pad_len)])
+                    perm_list.append(None)
                 patch_tokens_fg.append(patch_tokens[i][selected_idx])
                 mask_fg = torch.zeros(N_fg, dtype=torch.bool, device=patch_tokens.device)
                 mask_fg[:min(len(fg_idx), N_fg)] = True
@@ -269,10 +279,17 @@ class Aggregator(nn.Module):
             for i in range(patch_tokens.shape[0]):
                 fg_idx = torch.where(patch_mask_fullgrid[i])[0]
                 if len(fg_idx) >= N_fg:
-                    selected_idx = fg_idx[:N_fg]
+                    if random_fg:
+                        perm = torch.randperm(len(fg_idx), device=fg_idx.device)
+                        selected_idx = fg_idx[perm[:N_fg]]
+                        perm_list.append(perm)
+                    else:
+                        selected_idx = fg_idx[:N_fg]
+                        perm_list.append(None)
                 else:
                     pad_len = N_fg - len(fg_idx)
                     selected_idx = torch.cat([fg_idx, fg_idx.new_zeros(pad_len)])
+                    perm_list.append(None)
                 patch_tokens_fg.append(patch_tokens[i][selected_idx])
                 selected_indices_list.append(selected_idx)
             patch_tokens = torch.stack(patch_tokens_fg, dim=0)  # [B*S, N_fg, C]
@@ -292,10 +309,16 @@ class Aggregator(nn.Module):
             pos_fg = []
             for i in range(pos_full.shape[0]):
                 fg_idx = torch.where(patch_mask_fullgrid[i])[0]
+                perm = perm_list[i] if random_fg else None
                 if len(fg_idx) >= N_fg:
-                    selected_idx = fg_idx[:N_fg]
+                    if random_fg and perm is not None:
+                        selected_idx = fg_idx[perm[:N_fg]]
+                    else:
+                        selected_idx = fg_idx[:N_fg]
                 else:
                     pad_len = N_fg - len(fg_idx)
+                    if random_fg and len(fg_idx) > 0 and perm is not None:
+                        fg_idx = fg_idx[perm]
                     selected_idx = torch.cat([fg_idx, fg_idx.new_zeros(pad_len)])
                 pos_fg.append(pos_full[i][selected_idx])
             pos = torch.stack(pos_fg, dim=0)  # [B*S, N_fg, 2]
