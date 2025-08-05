@@ -613,10 +613,11 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     object_name = "Ob101"
     
-    # Suggestions:
-    # For quick testing, set image size to 518x518 and query_frame_num to 8
-    # For full experiments, use 952x952 and query_frame_num to 24 (max images=132 in 24GB GPU)
+    # Suggestions for Musa:
     # Remember to disable undistortion if working with undistorted images
+    # 1. For quick testing, set image size to 518x518 or 952x952 and query_frame_num to 8
+    # 2. For full experiments, use 952x952 and query_frame_num to 24 (max images=132 in 24GB GPU)
+    # 3. For tricky objects or maximum performance, use 952x952 and query_frame_num to self.max_images (and possibly set max_points_for_colmap to 50k or 100k so that it does not take 1 hour for each experiment)    
     class Args:
         def __init__(self, object_name):
             self.scene_dir = f"vggt-hh/dataset_vggt/{object_name}/handheld"  # Update this path
@@ -642,7 +643,7 @@ if __name__ == "__main__":
             self.fine_tracking = False
             # If necessary to speed up experiments limit to, for instance, 10k points for COLMAP reconstruction and BA. 
             # If query_frame_num is high: 3D points from point map and tracks are very dense, and using all makes BA and writing to disk very slow 
-            self.max_points_for_colmap = None #10000  
+            self.max_points_for_colmap = None #50000  
             
             # Non-BA parameters
             self.conf_thres_value = 1.0 # Not used if use_ba is True
