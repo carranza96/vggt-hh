@@ -372,10 +372,11 @@ def demo_fn(args):
         shared_camera = args.shared_camera  # in the feedforward manner, we do not support shared camera
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
+        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
         num_frames, height, width, _ = points_3d.shape
-        image_size = np.array([height, width])
+
         points_rgb = F.interpolate(
-            images, size=(height, width), mode="bilinear", align_corners=False
+            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
         )
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
         points_rgb = points_rgb.transpose(0, 2, 3, 1)
@@ -457,17 +458,10 @@ def demo_fn(args):
 
 
 def rename_colmap_recons_and_rescale_camera(
-    reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False, shared_camera=False, use_known_intrinsics=False
+    reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False, shared_camera=False
 ):
     rescale_camera = True
-    
-    # Define known intrinsics if needed
-    known_intrinsics = np.array([
-        [1543.5961, 0, 543.709494],
-        [0, 1549.81553, 963.609549],
-        [0, 0, 1]
-    ])
-
+    # TODO: Fix to output original image size (without internal cropping) and known intrinsics.
     for pyimageid in reconstruction.images:
         # Reshaped the padded&resized image to the original size
         # Rename the images to the original names
@@ -481,27 +475,13 @@ def rename_colmap_recons_and_rescale_camera(
 
             real_image_size = original_coords[pyimageid - 1, -2:]
             resize_ratio = max(real_image_size) / img_size
-            
-            if use_known_intrinsics:
-                # Use known calibrated intrinsics as-is (no scaling or modification)
-                print(f"Using known intrinsics for camera {pyimageid}")
-                
-                # Set camera parameters from known intrinsics (assuming PINHOLE model)
-                pred_params = np.array([
-                    known_intrinsics[0, 0],  # fx
-                    known_intrinsics[1, 1],  # fy
-                    known_intrinsics[0, 2],  # cx
-                    known_intrinsics[1, 2]   # cy
-                ])
-            else:
-                # Use predicted parameters with scaling
-                pred_params = pred_params * resize_ratio
-                real_pp = real_image_size / 2
-                pred_params[-2:] = real_pp  # center of the image
+            pred_params = pred_params * resize_ratio
+            real_pp = real_image_size / 2
+            pred_params[-2:] = real_pp  # center of the image
 
             pycamera.params = pred_params
-            pycamera.width = int(real_image_size[0])
-            pycamera.height = int(real_image_size[1])
+            pycamera.width = real_image_size[0]
+            pycamera.height = real_image_size[1]
 
         if shift_point2d_to_original_res:
             # Also shift the point2D to original resolution

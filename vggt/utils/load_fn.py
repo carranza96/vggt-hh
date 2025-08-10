@@ -234,8 +234,6 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
     original_height = int(original_coords[0][5].item())
     
     print(f"Image size after cropping: {original_height}x{original_width}")
-    print(f"Target square size: {target_size}x{target_size}")
-    
     # PADDING
     # Calculate padding transformation
     if original_width < original_height:
@@ -255,6 +253,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
     print(f"fx={newK[0, 0]}; fy={newK[1, 1]}; cx={newK[0, 2]}; cy={newK[1, 2]}")
     
     # RESIZING
+    print(f"Target square size: {target_size}x{target_size}")
     # Apply scale factor adjustment after padding
     max_dim = max(original_width, original_height)
     scale_factor = target_size / max_dim
