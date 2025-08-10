@@ -54,7 +54,6 @@ def batch_np_matrix_to_pycolmap(
 
     print(f"Total number of points: {P}")
     min_frames = 2  # or your threshold
-
     reproj_mask = None
 
     if max_reproj_error is not None:
@@ -62,7 +61,6 @@ def batch_np_matrix_to_pycolmap(
         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
         projected_points_2d[projected_points_cam[:, -1] <= 0] = 1e6
         reproj_mask = projected_diff < max_reproj_error
-        
         points_passing_reproj = np.sum(np.sum(reproj_mask, axis=0) >= min_frames)
         print(f"Unique points passing reproj_mask in at least {min_frames} frames: {points_passing_reproj}")
 
@@ -72,10 +70,9 @@ def batch_np_matrix_to_pycolmap(
 
 
     if masks is not None and reproj_mask is not None:
-        combined_mask = np.logical_and(masks, reproj_mask)
-        points_passing_combined = np.sum(np.sum(combined_mask, axis=0) >= min_frames)
+        masks = np.logical_and(masks, reproj_mask)
+        points_passing_combined = np.sum(np.sum(masks, axis=0) >= min_frames)
         print(f"Unique points passing both masks and reproj_mask in at least {min_frames} frames: {points_passing_combined}")
-        masks = combined_mask
     elif masks is not None:
         masks = masks
     else:

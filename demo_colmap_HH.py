@@ -103,9 +103,10 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
             images = images[None]  # add batch dimension
             aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks, random_fg=args.random_fg)
         torch.cuda.empty_cache()  
-        # Move aggregated tokens to GPU
-        aggregated_tokens_list = [t.to('cuda') if i in [4,11,17,23] else t for i,t in enumerate(aggregated_tokens_list)]
-        # aggregated_tokens_list_fg = [t.to('cuda') if i in [23] else t for i,t in enumerate(aggregated_tokens_list_fg)]
+        # Move aggregated tokens to GPU (only those layers used by point/depth head to save memory)
+        intermediate_layer_idx = model.point_head.intermediate_layer_idx # [4,11,17,23]
+        aggregated_tokens_list = [t.to('cuda') if i in intermediate_layer_idx else t for i,t in enumerate(aggregated_tokens_list)]
+        # aggregated_tokens_list_fg = [t.to('cuda') if i in intermediate_layer_idx else t for i,t in enumerate(aggregated_tokens_list_fg)]
         
         # Log memory after aggregator
         if torch.cuda.is_available():
@@ -136,73 +137,6 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
     depth_map = depth_map.squeeze(0).cpu().numpy()
     depth_conf = depth_conf.squeeze(0).cpu().numpy()
     return extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf
-
-
-def inject_known_intrinsics(newK, original_coords, images_shape, depth_shape, 
-                           load_imgs_squared, img_load_resolution, num_images):
-    """
-    Helper function to inject known intrinsics with proper scaling.
-    """
-    print("Using known intrinsics for 3D point unprojection")
-    original_known_intrinsics = newK
-    
-    original_width, original_height = original_coords[0, -2:].cpu().numpy()
-    processed_height, processed_width = images_shape[-2:]
-    
-    print(f"Original image size: {original_height}x{original_width}")
-    print(f"Processed image size: {processed_height}x{processed_width}")
-    
-    # Calculate padding transformation
-    if load_imgs_squared and processed_height == processed_width:
-        if original_width < original_height:
-            padding_x = (original_height - original_width) / 2
-            padding_y = 0
-        else:
-            padding_x = 0
-            padding_y = (original_width - original_height) / 2
-    else:
-        padding_x = 0
-        padding_y = 0
-    
-    print(f"Padding: x={padding_x}, y={padding_y}")
-    
-    # Apply padding transformation
-    padded_intrinsics = original_known_intrinsics.copy()
-    padded_intrinsics[0, 2] += padding_x  # cx += padding_x
-    padded_intrinsics[1, 2] += padding_y  # cy += padding_y
-    
-    # Scale from padded size to processed size
-    if load_imgs_squared:
-        if original_width < original_height:
-            scale_factor = processed_width / original_height
-        else:
-            scale_factor = processed_height / original_width
-    else:
-        scale_factor = min(processed_width / original_width, processed_height / original_height)
-    
-    print(f"Original intrinsics:\n{original_known_intrinsics}")
-    print(f"Padding adjusted intrinsics:\n{padded_intrinsics}")
-    padded_intrinsics[:2, :] *= scale_factor  # Scale fx, fy, cx, cy
-    print(f"Scale factor for intrinsics: {scale_factor}")
-    print(f"Scaled padded intrinsics:\n{padded_intrinsics}")
-    
-    # Replicate for all frames
-    intrinsic_for_unprojection = np.tile(padded_intrinsics[None, :, :], (num_images, 1, 1))
-    
-    # Scale to match depth map resolution
-    depth_height, depth_width = depth_shape[1], depth_shape[2]
-    depth_scale_x = depth_width / processed_width
-    depth_scale_y = depth_height / processed_height
-    
-    intrinsic_for_unprojection[:, 0, 0] *= depth_scale_x  # fx
-    intrinsic_for_unprojection[:, 1, 1] *= depth_scale_y  # fy
-    intrinsic_for_unprojection[:, 0, 2] *= depth_scale_x  # cx
-    intrinsic_for_unprojection[:, 1, 2] *= depth_scale_y  # cy
-    
-    print(f"Final intrinsics for depth map ({depth_height}x{depth_width}):")
-    print(intrinsic_for_unprojection[0])
-    
-    return intrinsic_for_unprojection
 
 
 def demo_fn(args):
@@ -259,49 +193,35 @@ def demo_fn(args):
         method=args.image_selection_method
     )
     
-    # Print first few images to show final selection
-    print(f"Final selection: {len(image_path_list)} images")
-    print("First 5 selected images:")
-    for i, path in enumerate(image_path_list[:5]):
-        print(f"  {i}: {os.path.basename(path)}")
-    
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates
     vggt_fixed_resolution = args.vggt_resolution
     
-    # Initialize variables for undistortion
-    newK = None
-    roi = None
-    
-    if args.load_imgs_squared:
-        img_load_resolution = args.img_load_resolution
-        print(f"Loading images with square padding and resize to {img_load_resolution}")
-        print("Applying camera undistortion before processing" if args.undistort_images else "Loading without undistortion")
-        images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
-        if args.undistort_images:
-            print(f"Using optimal camera matrix for undistortion")
-    else:
-        print(f"Loading images without resizing (original resolution)")
-        print("Applying camera undistortion to original resolution images" if args.undistort_images else "Loading without undistortion")
-        images, original_coords, newK, roi, masks = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
-        if args.undistort_images:
-            print(f"Using optimal camera matrix for undistortion")
-        img_load_resolution = None  # Variable resolution
+    # if args.load_imgs_squared:
+    img_load_resolution = args.img_load_resolution
+    print(f"Loading images with square padding and resize to {img_load_resolution}")
+    print("Applying camera undistortion before processing" if args.undistort_images else "Loading already undistorted images")
+    images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+    # else:
+        # TODO: To be implemented (using non-squared images)
+        # print(f"Loading images without resizing (original resolution)")
+        # print("Applying camera undistortion to original resolution images" if args.undistort_images else "Loading without undistortion")
+        # images, original_coords, newK, roi, masks = load_and_preprocess_images_no_resize(image_path_list, args.undistort_images)
+        # if args.undistort_images:
+        #     print(f"Using optimal camera matrix for undistortion")
+        # img_load_resolution = None  # Variable resolution
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir} with shape {images.shape}")
 
     if args.debugging_plots:
         plt.figure()
         plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
-        plt.savefig("sample_image.png")
+        plt.savefig("sample_image_vggt.png")
         if masks is not None:
             plt.figure()
             plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
-            plt.savefig("sample_mask.png")
-            print("Saved sample mask visualization")
-        else:
-            print("No masks available for visualization")
+            plt.savefig("sample_mask_vggt.png")
     
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
@@ -311,16 +231,10 @@ def demo_fn(args):
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
         # Use the camera matrix returned from loading function
-        # This will be optimal matrix if undistortion was applied, otherwise original
-        print(f"Using {'optimal' if args.undistort_images else 'original'} camera matrix from loading function as base intrinsics")
-        intrinsic = inject_known_intrinsics(
-            newK, original_coords, images.shape, depth_map.shape, 
-            args.load_imgs_squared, img_load_resolution, len(images))
+        print(f"Using new camera matrix from loading function as base intrinsics")
+        intrinsic = np.tile(newK[None, :, :], (len(images), 1, 1))
     else:
         print("Using VGGT-predicted intrinsics for 3D point unprojection")
-    
-    if masks is not None:
-        print("Using masks to filter background points in depth map unprojection") 
         
     if args.points_from_depth_map:
         points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
@@ -329,7 +243,7 @@ def demo_fn(args):
         depth_conf = point_conf.squeeze(0).cpu().numpy()
     # Apply same mask filtering to depth confidence
     if masks is not None:
-        print("Applying mask filtering to depth confidence")
+        print("Applying mask filtering to depth confidence, assigning zero confidence to background pixels")
         depth_conf_masked = depth_conf.copy()
         for i in range(len(masks)):
             mask = masks[i]
@@ -340,9 +254,7 @@ def demo_fn(args):
             foreground_mask = mask > 127
             # Zero out background confidence values
             depth_conf_masked[i][~foreground_mask] = 0.0
-        
         depth_conf = depth_conf_masked
-        print("Depth confidence filtered using masks")
     
     if args.debugging_plots:
         plot_dir = os.path.join(args.scene_dir, args.experiment_dir, "plots")
@@ -611,7 +523,7 @@ if __name__ == "__main__":
     from datetime import datetime
     
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    object_name = "Ob101"
+    object_name = "Ob68"
     
     # Suggestions for Musa:
     # Remember to disable undistortion if working with undistorted images
@@ -657,10 +569,10 @@ if __name__ == "__main__":
             self.img_load_resolution = 952  # Target resolution when using load_imgs_squared
             self.vggt_resolution = self.img_load_resolution  # VGGT model resolution
             
-            self.undistort_images = True  # TODO: Musa should disable this.
+            self.undistort_images = False # Undistort images before processing (adjusting intrinsics)
             
             # Aggregator (attention block) parameters
-            self.random_fg = True  # Use random foreground tokens for attention, else use first N tokens.
+            self.random_fg = False  # Use random foreground tokens for attention, else use first N tokens.
             
             # Debugging parameters
             self.debugging_plots = False
