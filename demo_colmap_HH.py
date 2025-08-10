@@ -415,8 +415,7 @@ def demo_fn(args):
         original_coords.cpu().numpy(),
         img_size=reconstruction_resolution,
         shift_point2d_to_original_res=True,
-        shared_camera=shared_camera,
-        use_known_intrinsics=args.use_known_intrinsics,
+        shared_camera=shared_camera
     )
 
     print(f"Saving reconstruction to {args.scene_dir}/{args.experiment_dir}")
