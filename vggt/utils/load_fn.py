@@ -20,8 +20,8 @@ def get_camera_intrinsics(undistorted_images=True):
     """
     if undistorted_images:
         camera_matrix = np.array([
-            [1.57984692e+03, 0.00000000e+00, 5.44577814e+02], # [fx,  0, cx]
-            [0.00000000e+00, 1.55774009e+03, 9.84074151e+02], # [ 0, fy, cy]
+            [1579.8469163526647, 0.00000000e+00, 544.5778139815045], # [fx,  0, cx]
+            [0.00000000e+00, 1557.7400876145111, 984.0741511029726], # [ 0, fy, cy]
             [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]   # [ 0,  0,  1]
         ])
         dist_coeffs = np.zeros(5)   
@@ -113,7 +113,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
         print(f"Camera matrix after undistortion adjustments:")
         print(f"fx={newK[0, 0]}; fy={newK[1, 1]}; cx={newK[0, 2]}; cy={newK[1, 2]}")
     else:
-        # For non-undistorted images, we'll set ROI based on first image dimensions
+        # For already undistorted images, we'll set ROI based on first image dimensions
         sample_img = Image.open(image_path_list[0])
         sample_width, sample_height = sample_img.size
         roi = (0, 0, sample_width, sample_height)
@@ -237,11 +237,11 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
     # PADDING
     # Calculate padding transformation
     if original_width < original_height:
-        padding_x = (original_height - original_width) / 2
+        padding_x = (original_height - original_width) // 2
         padding_y = 0
     else:
         padding_x = 0
-        padding_y = (original_width - original_height) / 2
+        padding_y = (original_width - original_height) // 2
     
     print(f"Padding: x={padding_x}, y={padding_y}")
     
