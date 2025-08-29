@@ -429,7 +429,7 @@ def demo_fn(args):
         )
         gpu_monitor.log_memory_stats("after COLMAP conversion")
 
-        reconstruction_resolution = vggt_fixed_resolution
+        reconstruction_resolution = vggt_fixed_resolution if not args.use_known_intrinsics else img_load_resolution
 
     reconstruction = rename_colmap_recons_and_rescale_camera(
         reconstruction,
