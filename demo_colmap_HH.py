@@ -63,7 +63,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=False):
+def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=False, token_filtering=True):
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
@@ -84,16 +84,29 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
         new_W = (new_W // 14) * 14
         
         images = F.interpolate(images, size=(new_H, new_W), mode="bilinear", align_corners=False)
+        masks = F.interpolate(masks, size=(new_H, new_W), mode="nearest")
         print(f"Resized maintaining aspect ratio to: {images.shape}")
     else:
         # Standard square resizing
         images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+        masks = F.interpolate(masks, size=(resolution, resolution), mode="nearest")
+
         print(f"Resized to square: {images.shape}")
     
     # Now move to GPU after resizing
     device = next(model.parameters()).device
     images = images.to(device)
-    
+    masks = masks.to(device)
+
+    if args.debugging_plots:
+        plt.figure()
+        plt.imshow(images[0].permute(1, 2, 0).cpu().numpy())
+        plt.savefig("sample_image_vggt_resized.png")
+        if masks is not None:
+            plt.figure()
+            plt.imshow(masks[0].permute(1, 2, 0).cpu().numpy())
+            plt.savefig("sample_mask_vggt_resized.png")
+            
     # Log memory before inference
     if torch.cuda.is_available():
         print(f"GPU memory before VGGT inference: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB")
@@ -101,7 +114,10 @@ def run_VGGT(model, images, masks, dtype, resolution=518, maintain_aspect_ratio=
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks, random_fg=args.random_fg)
+            if token_filtering:
+                aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks=masks, random_fg=args.random_fg)
+            else:
+                aggregated_tokens_list, aggregated_tokens_list_fg, ps_idx = model.aggregator(images, masks=None)
         torch.cuda.empty_cache()  
         # Move aggregated tokens to GPU (only those layers used by point/depth head to save memory)
         intermediate_layer_idx = model.point_head.intermediate_layer_idx # [4,11,17,23]
@@ -202,7 +218,7 @@ def demo_fn(args):
     img_load_resolution = args.img_load_resolution
     print(f"Loading images with square padding and resize to {img_load_resolution}")
     print("Applying camera undistortion before processing" if args.undistort_images else "Loading already undistorted images")
-    images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images)
+    images, original_coords, newK, roi, masks = load_and_preprocess_images_square(image_path_list, img_load_resolution, args.undistort_images, args.global_mask_crop)
     # else:
         # TODO: To be implemented (using non-squared images)
         # print(f"Loading images without resizing (original resolution)")
@@ -226,7 +242,7 @@ def demo_fn(args):
     # Run VGGT to estimate camera and depth
     # Use aspect ratio preservation when not using squared loading
     maintain_aspect_ratio = not args.load_imgs_squared
-    extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf = run_VGGT(model, images, masks, dtype, vggt_fixed_resolution, maintain_aspect_ratio)
+    extrinsic, intrinsic, depth_map, depth_conf, point_map, point_conf = run_VGGT(model, images, masks, dtype, vggt_fixed_resolution, maintain_aspect_ratio, args.token_filtering)
     
     # Inject known intrinsics for 3D point unprojection
     if args.use_known_intrinsics:
@@ -237,13 +253,16 @@ def demo_fn(args):
         print("Using VGGT-predicted intrinsics for 3D point unprojection")
         
     if args.points_from_depth_map:
-        points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, masks)
+        points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
     else:
         points_3d = point_map.squeeze(0).cpu().numpy()
         depth_conf = point_conf.squeeze(0).cpu().numpy()
     # Apply same mask filtering to depth confidence
     if masks is not None:
         print("Applying mask filtering to depth confidence, assigning zero confidence to background pixels")
+        if img_load_resolution!=vggt_fixed_resolution:
+            masks = F.interpolate(masks, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="nearest")
+
         depth_conf_masked = depth_conf.copy()
         for i in range(len(masks)):
             mask = masks[i]
@@ -269,12 +288,12 @@ def demo_fn(args):
             axs[0, 1].set_title(f"Mask [{ind}]")
             axs[0, 1].imshow(masks[ind].permute(1,2,0).cpu().numpy(), cmap="magma")
             fig.colorbar(axs[0, 1].images[0], ax=axs[0, 1], fraction=0.046, pad=0.04, label="Mask")
-            axs[0, 1].axis('off')
+            # axs[0, 1].axis('off')
             # Depth
             axs[0, 2].set_title(f"Depth [{ind}]")
             im_depth = axs[0, 2].imshow(depth_map[ind], cmap="magma")
             fig.colorbar(im_depth, ax=axs[0, 2], fraction=0.046, pad=0.04, label="Depth")
-            axs[0, 2].axis('off')
+            # axs[0, 2].axis('off')
             # Masked Depth
             axs[1, 0].set_title(f"Depth Masked [{ind}]")
             mask = masks[ind]
@@ -285,12 +304,12 @@ def demo_fn(args):
             depth_map_masked[~foreground_mask] = 0.0
             im_depth_masked = axs[1, 0].imshow(depth_map_masked, cmap="magma")
             fig.colorbar(im_depth_masked, ax=axs[1, 0], fraction=0.046, pad=0.04, label="Depth (masked)")
-            axs[1, 0].axis('off')
+            # axs[1, 0].axis('off')
             # Depth Confidence
             axs[1, 1].set_title(f"Depth Conf [{ind}]")
             im_conf = axs[1, 1].imshow(depth_conf[ind], cmap="magma")
             fig.colorbar(im_conf, ax=axs[1, 1], fraction=0.046, pad=0.04, label="Depth Confidence")
-            axs[1, 1].axis('off')
+            # axs[1, 1].axis('off')
             # Empty plot for layout
             axs[1, 2].axis('off')
             plt.tight_layout()
@@ -339,7 +358,8 @@ def demo_fn(args):
             gpu_monitor.log_memory_stats("after track prediction")
 
         # rescale the intrinsic matrix from vggt_fixed_resolution to img_load_resolution
-        intrinsic[:, :2, :] *= scale
+        if not args.use_known_intrinsics:
+            intrinsic[:, :2, :] *= scale
         track_mask = pred_vis_scores > args.vis_thresh
 
         # TODO: radial distortion, iterative BA, masks
@@ -361,9 +381,11 @@ def demo_fn(args):
             raise ValueError("No reconstruction can be built with BA")
 
         # Bundle Adjustment
+        print("Camera intrinsics before BA:", reconstruction.cameras)
         ba_options = pycolmap.BundleAdjustmentOptions(refine_focal_length=False, refine_principal_point=False,refine_extra_params=False)
         pycolmap.bundle_adjustment(reconstruction, ba_options)
         gpu_monitor.log_memory_stats("after bundle adjustment")
+        print("Camera intrinsics after BA:", reconstruction.cameras)
 
         reconstruction_resolution = img_load_resolution
     else:
@@ -529,7 +551,7 @@ if __name__ == "__main__":
             self.vis_thresh = 0.2   # TODO: Explore: Maybe increase this threshold? Default was 0.2 for depth map points.
             #TODO: Query_frame_num is important. Higher values (or using all images) will give more points and better results at the cost of speed. But if using all images, results can have more than 500k points.
             # Default is 8, but setting it to 24 for instance can improve results. If you get error "No reconstruction can be built with BA" then try to increase this value.
-            self.query_frame_num = 24   
+            self.query_frame_num = 8   
             self.max_query_pts = 4096
             self.fine_tracking = False
             # If necessary to speed up experiments limit to, for instance, 10k points for COLMAP reconstruction and BA. 
@@ -547,10 +569,11 @@ if __name__ == "__main__":
             # TODO: Image resolution: Use 952x952, 700x700 or 518x518? Using 952x952 if speed is reasonable
             self.img_load_resolution = 952  # Target resolution when using load_imgs_squared
             self.vggt_resolution = self.img_load_resolution  # VGGT model resolution
-            
-            self.undistort_images = False # Undistort images before processing (adjusting intrinsics)
+            self.global_mask_crop = True  # Enable global mask cropping
+            self.undistort_images = False  # Undistort images before processing (adjusting intrinsics)
             
             # Aggregator (attention block) parameters
+            self.token_filtering = True  # Enable token filtering in aggregator
             self.random_fg = False  # Use random foreground tokens for attention, else use first N tokens.
             
             # Debugging parameters

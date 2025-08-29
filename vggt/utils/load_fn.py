@@ -41,7 +41,7 @@ def get_camera_intrinsics(undistorted_images=True):
     return camera_matrix, dist_coeffs
 
 
-def load_and_preprocess_images_square(image_path_list, target_size=1024, undistort_images=False):
+def load_and_preprocess_images_square(image_path_list, target_size=1024, undistort_images=False, global_mask_crop=True):
     """
     Load and preprocess images by center padding to square and resizing to target size.
     Also returns the position information of original pixels after transformation and alpha masks if present.
@@ -176,22 +176,23 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024, undisto
         # Apply vertical crop if min_y and max_y are set
         crop_top, crop_bottom = 0, None
         crop_left, crop_right = 0, None
-        width, height = img.size
-        if min_y is not None and max_y is not None:
-            crop_top = min_y
-            crop_bottom = max_y + 1  # +1 to include max_y
-        else:
-            crop_bottom = height
-        if min_x is not None and max_x is not None:
-            crop_left = min_x
-            crop_right = max_x + 1  # +1 to include max_x
-        else:
-            crop_right = width
-        # Crop image if needed
-        if (crop_top != 0 or crop_bottom != height) or (crop_left != 0 or crop_right != width):
-            img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
-            if alpha_mask is not None:
-                alpha_mask = alpha_mask.crop((crop_left, crop_top, crop_right, crop_bottom))
+        if global_mask_crop:
+            width, height = img.size
+            if min_y is not None and max_y is not None:
+                crop_top = min_y
+                crop_bottom = max_y + 1  # +1 to include max_y
+            else:
+                crop_bottom = height
+            if min_x is not None and max_x is not None:
+                crop_left = min_x
+                crop_right = max_x + 1  # +1 to include max_x
+            else:
+                crop_right = width
+            # Crop image if needed
+            if (crop_top != 0 or crop_bottom != height) or (crop_left != 0 or crop_right != width):
+                img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+                if alpha_mask is not None:
+                    alpha_mask = alpha_mask.crop((crop_left, crop_top, crop_right, crop_bottom))
 
         width, height = img.size
         max_dim = max(width, height)
